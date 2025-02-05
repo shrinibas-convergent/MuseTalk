@@ -19,7 +19,6 @@ def cleanup_temp_files(file_paths: list):
 @app.post("/lipsync")
 async def lipsync_endpoint(
     avatar_id: str = Form(...),
-    video_path: str = Form(DEFAULT_VIDEO_PATH),
     bbox_shift: int = Form(DEFAULT_BBOX_SHIFT),
     batch_size: int = Form(DEFAULT_BATCH_SIZE),
     audio_file: UploadFile = File(...),
@@ -36,7 +35,7 @@ async def lipsync_endpoint(
         audio_temp_path = os.path.join(TEMP_DIR, f"{avatar_id}_audio.wav")
         with open(audio_temp_path, "wb") as f:
             f.write(await audio_file.read())
-        
+        video_path = "data/video/" + avatar_id
         # Create or get the avatar
         avatar = await run_in_threadpool(get_or_create_avatar, avatar_id, video_path, bbox_shift, batch_size)
 
