@@ -66,3 +66,32 @@ async def lipsync_endpoint(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+@app.post("/create_avatar")
+async def create_avatar_endpoint(
+    avatar_id: str = Form(...),
+    video_file: UploadFile = File(...),
+    bbox_shift: int = Form(DEFAULT_BBOX_SHIFT),
+    batch_size: int = Form(DEFAULT_BATCH_SIZE),
+):
+    """
+    Upload a video to the data/video folder and create an avatar from it.
+    The video is saved to the 'data/video' folder and then used to create the avatar.
+    """
+    try:
+        # Ensure the destination folder exists.
+        video_folder = "data/video"
+        os.makedirs(video_folder, exist_ok=True)
+        
+        # Save the uploaded video file
+        video_path = os.path.join(video_folder, avatar_id)
+        with open(video_path, "wb") as f:
+            f.write(await video_file.read())
+        
+        # Force preparation mode so the avatar is (re)created from the new video.
+        avatar = await run_in_threadpool(get_or_create_avatar, avatar_id, video_path, bbox_shift, batch_size, True)
+        
+        return {"message": f"Avatar '{avatar_id}' created successfully using video '{video_file.filename}'."}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
