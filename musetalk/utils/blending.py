@@ -85,16 +85,51 @@ def get_image_prepare_material(image,face_box,upper_boundary_ratio = 0.5,expand=
     mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)
     return mask_array,crop_box
 
-def get_image_blending(image,face,face_box,mask_array,crop_box):
-    body = image
+def get_image_blending(image, face, face_box, mask_array, crop_box):
+    """
+    Blends the 'face' into the 'image' using a mask.
+    
+    Parameters:
+      image: The original image.
+      face: The face image to be inserted.
+      face_box: A tuple (x, y, x1, y1) defining the region in the image where the face should go.
+      mask_array: The mask used for blending. Can be either a 3-channel image or already grayscale.
+      crop_box: A tuple (x_s, y_s, x_e, y_e) defining the region to crop from the image.
+      
+    Returns:
+      Blended image.
+    """
+    # Make a copy of the original image
+    body = image.copy()
+    
+    # Unpack the face and crop boxes
     x, y, x1, y1 = face_box
     x_s, y_s, x_e, y_e = crop_box
+    
+    # Extract the region from the original image where blending will occur
     face_large = copy.deepcopy(body[y_s:y_e, x_s:x_e])
-    face_large[y-y_s:y1-y_s, x-x_s:x1-x_s]=face
+    
+    # Determine the region in face_large where the face will be inserted
+    face_region_y1 = y - y_s
+    face_region_y2 = y1 - y_s
+    face_region_x1 = x - x_s
+    face_region_x2 = x1 - x_s
+    face_large[face_region_y1:face_region_y2, face_region_x1:face_region_x2] = face
 
-    mask_image = cv2.cvtColor(mask_array,cv2.COLOR_BGR2GRAY)
-    mask_image = (mask_image/255).astype(np.float32)
+    # Check if the mask is already single-channel. If not, convert it.
+    if len(mask_array.shape) == 2:
+        mask_image = mask_array.astype(np.float32) / 255.0
+    else:
+        mask_image = cv2.cvtColor(mask_array, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
 
-    body[y_s:y_e, x_s:x_e] = cv2.blendLinear(face_large,body[y_s:y_e, x_s:x_e],mask_image,1-mask_image)
+    # Ensure the mask has 3 channels to blend with a color image.
+    mask_image_3ch = np.stack([mask_image]*3, axis=-1)
+
+    # Blend the face_large region with the original image region using the mask.
+    # For each pixel: output = alpha * face_large + (1 - alpha) * original
+    blended_region = (mask_image_3ch * face_large + (1 - mask_image_3ch) * body[y_s:y_e, x_s:x_e]).astype(np.uint8)
+    
+    # Replace the blended region back into the original image
+    body[y_s:y_e, x_s:x_e] = blended_region
 
     return body
