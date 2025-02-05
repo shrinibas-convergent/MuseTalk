@@ -18,10 +18,10 @@ from musetalk.utils.blending import get_image_blending
 from musetalk.utils.utils import datagen
 
 # Import global models from model.py
-from model import audio_processor, vae, unet, pe, device, timesteps
+from server.model import audio_processor, vae, unet, pe, device, timesteps
 
 # Import configuration defaults
-from config import DEFAULT_BATCH_SIZE, RESULTS_DIR
+from server.config import DEFAULT_BATCH_SIZE, RESULTS_DIR
 
 def osmakedirs(path_list):
     for path in path_list:
@@ -246,7 +246,7 @@ class Avatar:
         if os.path.exists(temp_video):
             os.remove(temp_video)
         shutil.rmtree(tmp_dir)
-        print(f"Inference complete. Result saved to {output_vid}")
+        print(f"Inference complete took {(time.time() - start_time) * 1000:.2f}ms.")
         return output_vid
 
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):

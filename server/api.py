@@ -4,8 +4,8 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.background import BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
-from avatar import get_or_create_avatar
-from config import DEFAULT_VIDEO_PATH, DEFAULT_BBOX_SHIFT, DEFAULT_BATCH_SIZE, DEFAULT_FPS, TEMP_DIR
+from server.avatar import get_or_create_avatar
+from server.config import DEFAULT_VIDEO_PATH, DEFAULT_BBOX_SHIFT, DEFAULT_BATCH_SIZE, DEFAULT_FPS, TEMP_DIR
 
 app = FastAPI(title="MuseTalk HTTP Lipsync API")
 
