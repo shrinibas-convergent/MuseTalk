@@ -1,6 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cu118 
+--extra-index-url https://download.pytorch.org/whl/cu118
 torch==2.0.1
-torchvision==0.15.2 
+torchvision==0.15.2
 torchaudio==2.0.2
 diffusers==0.27.2
 accelerate==0.28.0
@@ -9,6 +9,7 @@ tensorboard==2.12.0
 opencv-python==4.9.0.80
 soundfile==0.12.1
 transformers==4.39.2
+huggingface_hub==0.25.2
 
 gdown
 requests
@@ -19,3 +20,8 @@ ffmpeg-python
 gradio
 spaces
 moviepy
+ipykernel
+
+tqdm
+uvicorn[standard]
+fastapi
