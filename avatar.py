@@ -59,13 +59,17 @@ class Avatar:
                     self.input_latent_list_cycle = torch.load(self.latents_out_path)
                     with open(self.coords_path, 'rb') as f:
                         self.coord_list_cycle = pickle.load(f)
-                    input_img_list = sorted(glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')),
-                                             key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+                    input_img_list = sorted(
+                        glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')),
+                        key=lambda x: int(os.path.splitext(os.path.basename(x))[0])
+                    )
                     self.frame_list_cycle = read_imgs(input_img_list)
                     with open(self.mask_coords_path, 'rb') as f:
                         self.mask_coords_list_cycle = pickle.load(f)
-                    input_mask_list = sorted(glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]')),
-                                              key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+                    input_mask_list = sorted(
+                        glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]')),
+                        key=lambda x: int(os.path.splitext(os.path.basename(x))[0])
+                    )
                     self.mask_list_cycle = read_imgs(input_mask_list)
                     return
                 except Exception as e:
@@ -92,13 +96,17 @@ class Avatar:
                     self.input_latent_list_cycle = torch.load(self.latents_out_path)
                     with open(self.coords_path, 'rb') as f:
                         self.coord_list_cycle = pickle.load(f)
-                    input_img_list = sorted(glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')),
-                                             key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+                    input_img_list = sorted(
+                        glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')),
+                        key=lambda x: int(os.path.splitext(os.path.basename(x))[0])
+                    )
                     self.frame_list_cycle = read_imgs(input_img_list)
                     with open(self.mask_coords_path, 'rb') as f:
                         self.mask_coords_list_cycle = pickle.load(f)
-                    input_mask_list = sorted(glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]')),
-                                              key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+                    input_mask_list = sorted(
+                        glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]')),
+                        key=lambda x: int(os.path.splitext(os.path.basename(x))[0])
+                    )
                     self.mask_list_cycle = read_imgs(input_mask_list)
 
     def prepare_material(self):
@@ -121,8 +129,10 @@ class Avatar:
             print(f"Copying images from folder: {self.video_path}")
             files = sorted([file for file in os.listdir(self.video_path) if file.endswith("png")])
             for filename in files:
-                shutil.copyfile(os.path.join(self.video_path, filename),
-                                os.path.join(self.full_imgs_path, filename))
+                shutil.copyfile(
+                    os.path.join(self.video_path, filename),
+                    os.path.join(self.full_imgs_path, filename)
+                )
 
         input_img_list = sorted(glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')))
         print("Extracting landmarks ...")
@@ -163,7 +173,7 @@ class Avatar:
 
     def inference(self, audio_path, out_vid_name, fps, skip_save_images):
         """
-        Process the given audio file and generate an MP4 video file.
+        Process the given audio file and generate an MP4 video file with audio.
         Returns the path to the generated MP4 file.
         """
         tmp_dir = os.path.join(self.avatar_path, "tmp")
@@ -216,15 +226,28 @@ class Avatar:
                 res_frame_queue.put(res_frame)
         process_thread.join()
 
-        # Create video from images using ffmpeg.
-        output_dir = self.video_out_path
-        os.makedirs(output_dir, exist_ok=True)
-        mp4_file = os.path.join(output_dir, out_vid_name + ".mp4")
-        cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {tmp_dir}/%08d.png -vcodec libx264 -vf format=rgb24,scale=out_color_matrix=bt709,format=yuv420p -crf 18 {mp4_file}"
+        # First, create a silent video from the image sequence.
+        temp_video = os.path.join(self.avatar_path, "temp.mp4")
+        cmd_img2video = (
+            f"ffmpeg -y -v warning -r {fps} -f image2 -i {tmp_dir}/%08d.png "
+            f"-vcodec libx264 -vf format=rgb24,scale=out_color_matrix=bt709,format=yuv420p -crf 18 {temp_video}"
+        )
         os.system(cmd_img2video)
+
+        # Merge the original audio with the silent video to produce the final output.
+        output_vid = os.path.join(self.video_out_path, out_vid_name + ".mp4")
+        cmd_combine_audio = (
+            f"ffmpeg -y -v warning -i {audio_path} -i {temp_video} "
+            f"-c:v copy -c:a aac -strict experimental {output_vid}"
+        )
+        os.system(cmd_combine_audio)
+
+        # Cleanup temporary video and image directory.
+        if os.path.exists(temp_video):
+            os.remove(temp_video)
         shutil.rmtree(tmp_dir)
-        print(f"Inference complete. Result saved to {mp4_file}")
-        return mp4_file
+        print(f"Inference complete. Result saved to {output_vid}")
+        return output_vid
 
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
     """
@@ -233,15 +256,19 @@ def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_B
     """
     avatar_dir = os.path.join(RESULTS_DIR, avatar_id)
     if os.path.exists(avatar_dir):
-        avatar_instance = Avatar(avatar_id=avatar_id,
-                                 video_path=video_path,
-                                 bbox_shift=bbox_shift,
-                                 batch_size=batch_size,
-                                 preparation=False)
+        avatar_instance = Avatar(
+            avatar_id=avatar_id,
+            video_path=video_path,
+            bbox_shift=bbox_shift,
+            batch_size=batch_size,
+            preparation=False
+        )
     else:
-        avatar_instance = Avatar(avatar_id=avatar_id,
-                                 video_path=video_path,
-                                 bbox_shift=bbox_shift,
-                                 batch_size=batch_size,
-                                 preparation=True)
+        avatar_instance = Avatar(
+            avatar_id=avatar_id,
+            video_path=video_path,
+            bbox_shift=bbox_shift,
+            batch_size=batch_size,
+            preparation=True
+        )
     return avatar_instance
