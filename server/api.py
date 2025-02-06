@@ -61,7 +61,7 @@ async def lipsync_endpoint(
         if not os.path.exists(mp4_file_path):
             raise HTTPException(status_code=500, detail="Generated video file not found.")
         
-        background_tasks.add_task(cleanup_temp_files, [audio_temp_path, mp4_file_path])
+        # background_tasks.add_task(cleanup_temp_files, [audio_temp_path, mp4_file_path])
         # Stream the generated video as the response
         def video_stream():
             with open(mp4_file_path, "rb") as vid_file:
