@@ -55,11 +55,10 @@ async def lipsync_endpoint(
         # Create or get the avatar (this may include preparation if needed).
         avatar = await run_in_threadpool(get_or_create_avatar, avatar_id, video_path, bbox_shift, batch_size)
         
-        # Run inference in a background thread.
         def run_inference():
             mp4_path = avatar.inference(
                 audio_path=audio_temp_path,
-                out_vid_name=f"{avatar_id}_result",
+                out_vid_name=f"{avatar_id}_result_chunk{chunk}",
                 fps=DEFAULT_FPS,
                 skip_save_images=False,
             )

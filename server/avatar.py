@@ -11,6 +11,7 @@ import shutil
 import threading
 import numpy as np
 from tqdm import tqdm
+import copy
 
 # Import helper functions from the musetalk package
 from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
@@ -230,23 +231,32 @@ class Avatar:
         temp_video = os.path.join(self.avatar_path, "temp.mp4")
         cmd_img2video = (
             f"ffmpeg -y -v warning -r {fps} -f image2 -i {tmp_dir}/%08d.png "
-            f"-vcodec libx264 -vf format=rgb24,scale=out_color_matrix=bt709,format=yuv420p -crf 18 {temp_video}"
+            f"-vcodec libx264 -movflags +frag_keyframe+empty_moov -vf format=rgb24,scale=out_color_matrix=bt709,format=yuv420p -crf 18 {temp_video}"
         )
         os.system(cmd_img2video)
 
-        # Merge the original audio with the silent video to produce the final output.
+        # Re-encode the original audio to a canonical WAV file.
+        temp_audio_conv = os.path.join(self.avatar_path, "temp_audio_conv.wav")
+        cmd_convert_audio = (
+            f"ffmpeg -y -v warning -err_detect ignore_err -i {audio_path} -ar 44100 -ac 2 {temp_audio_conv}"
+        )
+        os.system(cmd_convert_audio)
+
+        # Merge the re-encoded audio with the silent video to produce the final fragmented MP4.
         output_vid = os.path.join(self.video_out_path, out_vid_name + ".mp4")
         cmd_combine_audio = (
-            f"ffmpeg -y -v warning -i {audio_path} -i {temp_video} "
-            f"-c:v copy -c:a aac -strict experimental {output_vid}"
+            f"ffmpeg -y -v warning -err_detect ignore_err -i {temp_audio_conv} -i {temp_video} "
+            f"-c:v copy -c:a aac -movflags +frag_keyframe+empty_moov -strict experimental {output_vid}"
         )
         os.system(cmd_combine_audio)
 
         # Cleanup temporary video and image directory.
         if os.path.exists(temp_video):
             os.remove(temp_video)
+        if os.path.exists(temp_audio_conv):
+            os.remove(temp_audio_conv)
         shutil.rmtree(tmp_dir)
-        print(f"Inference complete took {(time.time() - start_time) * 1000:.2f}ms.")
+        print(f"Inference complete. Result saved to {output_vid}")
         return output_vid
 
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
