@@ -1,5 +1,6 @@
 # http_api.py
 import os
+from pathlib import Path
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.background import BackgroundTasks
@@ -35,7 +36,7 @@ async def lipsync_endpoint(
         audio_temp_path = os.path.join(TEMP_DIR, f"{avatar_id}_audio.wav")
         with open(audio_temp_path, "wb") as f:
             f.write(await audio_file.read())
-        video_path = "data/video/" + avatar_id
+        video_path = "data/video/" + avatar_id + ".mp4"
         # Create or get the avatar
         avatar = await run_in_threadpool(get_or_create_avatar, avatar_id, video_path, bbox_shift, batch_size)
 
@@ -83,7 +84,7 @@ async def create_avatar_endpoint(
         os.makedirs(video_folder, exist_ok=True)
         
         # Save the uploaded video file
-        video_path = os.path.join(video_folder, avatar_id)
+        video_path = os.path.join(video_folder, avatar_id + Path(video_file.filename).suffix)
         with open(video_path, "wb") as f:
             f.write(await video_file.read())
         
