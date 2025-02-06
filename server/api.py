@@ -7,9 +7,15 @@ from fastapi.background import BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from server.avatar import get_or_create_avatar
 from server.config import DEFAULT_VIDEO_PATH, DEFAULT_BBOX_SHIFT, DEFAULT_BATCH_SIZE, DEFAULT_FPS, TEMP_DIR
-
+from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="MuseTalk HTTP Lipsync API")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # or specify allowed origins like ["http://localhost:3000"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 def cleanup_temp_files(file_paths: list):
