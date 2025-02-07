@@ -174,87 +174,65 @@ class Avatar:
 
     def inference(self, audio_path, out_vid_name, fps, skip_save_images):
         """
-        Process the given audio file and generate an MP4 video file with audio.
-        Returns the path to the generated MP4 file.
+        Process audio and generate an MP4 video file in a more real-time and efficient manner.
         """
         tmp_dir = os.path.join(self.avatar_path, "tmp")
         os.makedirs(tmp_dir, exist_ok=True)
         print("Starting inference ...")
         start_time = time.time()
-        # Extract audio features and divide audio into chunks.
+
+        # Extract audio features
         whisper_feature = audio_processor.audio2feat(audio_path)
         whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
         print(f"Audio processing took {(time.time() - start_time) * 1000:.2f}ms")
         total_chunks = len(whisper_chunks)
-        res_frame_queue = queue.Queue()
-        self.idx = 0
 
-        # Start a thread to process frames in order.
-        def process_frames():
-            count = 0
-            while count < total_chunks:
-                try:
-                    res_frame = res_frame_queue.get(timeout=1)
-                except queue.Empty:
-                    continue
-                bbox = self.coord_list_cycle[self.idx % len(self.coord_list_cycle)]
-                ori_frame = self.frame_list_cycle[self.idx % len(self.frame_list_cycle)].copy()
-                x1, y1, x2, y2 = bbox
-                try:
-                    res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
-                except Exception as e:
-                    print(f"Error resizing frame: {e}")
-                    continue
-                mask = self.mask_list_cycle[self.idx % len(self.mask_list_cycle)]
-                mask_crop_box = self.mask_coords_list_cycle[self.idx % len(self.mask_coords_list_cycle)]
-                combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
-                cv2.imwrite(os.path.join(tmp_dir, f"{self.idx:08d}.png"), combined_frame)
-                self.idx += 1
-                count += 1
+        # Use cv2.VideoWriter for in-memory frame writing
+        temp_video = os.path.join(self.avatar_path, "temp.mp4")
+        width, height = self.frame_list_cycle[0].shape[1], self.frame_list_cycle[0].shape[0]
+        video_writer = cv2.VideoWriter(
+            temp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+        )
 
-        process_thread = threading.Thread(target=process_frames)
-        process_thread.start()
-
-        # Run inference in batches.
+        # Process frames in real-time
         gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
-        for _, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=int((total_chunks + self.batch_size - 1) / self.batch_size))):
+        for idx, (whisper_batch, latent_batch) in enumerate(
+            tqdm(gen, total=int((total_chunks + self.batch_size - 1) / self.batch_size))
+        ):
+            # Audio feature and latent processing
             audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
             audio_feature_batch = pe(audio_feature_batch)
             latent_batch = latent_batch.to(dtype=unet.model.dtype)
+
+            # Predict and decode latent frames
             pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
             recon = vae.decode_latents(pred_latents)
+
             for res_frame in recon:
-                res_frame_queue.put(res_frame)
-        process_thread.join()
+                bbox = self.coord_list_cycle[self.idx % len(self.coord_list_cycle)]
+                ori_frame = self.frame_list_cycle[self.idx % len(self.frame_list_cycle)].copy()
+                x1, y1, x2, y2 = bbox
+                res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                mask = self.mask_list_cycle[self.idx % len(self.mask_list_cycle)]
+                mask_crop_box = self.mask_coords_list_cycle[self.idx % len(self.mask_coords_list_cycle)]
+                combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
 
-        # First, create a silent video from the image sequence.
-        temp_video = os.path.join(self.avatar_path, "temp.mp4")
-        cmd_img2video = (
-            f"ffmpeg -y -v warning -r {fps} -f image2 -i {tmp_dir}/%08d.png "
-            f"-vcodec libx264 -movflags +frag_keyframe+empty_moov -vf format=rgb24,scale=out_color_matrix=bt709,format=yuv420p -crf 18 {temp_video}"
-        )
-        os.system(cmd_img2video)
+                # Write frame to video in-memory
+                video_writer.write(combined_frame)
+                self.idx += 1
 
-        # Re-encode the original audio to a canonical WAV file.
-        temp_audio_conv = os.path.join(self.avatar_path, "temp_audio_conv.wav")
-        cmd_convert_audio = (
-            f"ffmpeg -y -v warning -err_detect ignore_err -i {audio_path} -ar 44100 -ac 2 {temp_audio_conv}"
-        )
-        os.system(cmd_convert_audio)
+        video_writer.release()
 
-        # Merge the re-encoded audio with the silent video to produce the final fragmented MP4.
+        # Combine audio with the video
         output_vid = os.path.join(self.video_out_path, out_vid_name + ".mp4")
         cmd_combine_audio = (
-            f"ffmpeg -y -v warning -err_detect ignore_err -i {temp_audio_conv} -i {temp_video} "
+            f"ffmpeg -y -v warning -err_detect ignore_err -i {audio_path} -i {temp_video} "
             f"-c:v copy -c:a aac -movflags +frag_keyframe+empty_moov -strict experimental {output_vid}"
         )
         os.system(cmd_combine_audio)
 
-        # Cleanup temporary video and image directory.
-        if os.path.exists(temp_video):
-            os.remove(temp_video)
-        if os.path.exists(temp_audio_conv):
-            os.remove(temp_audio_conv)
+        # Cleanup
+        os.remove(temp_video)
         shutil.rmtree(tmp_dir)
         print(f"Inference complete. Result saved to {output_vid}")
         return output_vid
