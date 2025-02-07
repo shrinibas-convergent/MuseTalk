@@ -32,7 +32,7 @@ def osmakedirs(path_list):
 class Avatar:
     def __init__(self, avatar_id, video_path, bbox_shift, batch_size, preparation):
         self.avatar_id = avatar_id
-        self.video_path = video_path
+        self.video_path = str(video_path)
         self.bbox_shift = bbox_shift
         self.avatar_path = os.path.join(RESULTS_DIR, avatar_id)
         self.full_imgs_path = os.path.join(self.avatar_path, "full_imgs")
