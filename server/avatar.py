@@ -9,6 +9,7 @@ import queue
 import pickle
 import shutil
 import threading
+import subprocess
 import numpy as np
 from tqdm import tqdm
 import copy
@@ -172,71 +173,115 @@ class Avatar:
         torch.save(self.input_latent_list_cycle, self.latents_out_path)
         print("Avatar preparation complete.")
 
-    def inference(self, audio_path, out_vid_name, fps, skip_save_images):
+    def inference_mse(self, audio_path, fps):
         """
-        Process audio and generate an MP4 video file in a more real-time and efficient manner.
+        Process the given audio file and generate a fragmented MP4 stream (suitable for Media Source Extensions).
+        Yields chunks of the MP4 stream.
         """
-        tmp_dir = os.path.join(self.avatar_path, "tmp")
-        os.makedirs(tmp_dir, exist_ok=True)
-        print("Starting inference ...")
+        print("Starting MSE streaming inference ...")
         start_time = time.time()
-
-        # Extract audio features
+        # Extract audio features and divide audio into chunks.
         whisper_feature = audio_processor.audio2feat(audio_path)
         whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
-        print(f"Audio processing took {(time.time() - start_time) * 1000:.2f}ms")
         total_chunks = len(whisper_chunks)
+        res_frame_queue = queue.Queue()
+        self.idx = 0
 
-        # Use cv2.VideoWriter for in-memory frame writing
-        temp_video = os.path.join(self.avatar_path, "temp.mp4")
-        width, height = self.frame_list_cycle[0].shape[1], self.frame_list_cycle[0].shape[0]
-        video_writer = cv2.VideoWriter(
-            temp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-        )
+        # This queue will hold the final blended frames to be sent to ffmpeg.
+        raw_frame_queue = queue.Queue()
 
-        # Process frames in real-time
-        gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
-        for idx, (whisper_batch, latent_batch) in enumerate(
-            tqdm(gen, total=int((total_chunks + self.batch_size - 1) / self.batch_size))
-        ):
-            # Audio feature and latent processing
-            audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
-            audio_feature_batch = pe(audio_feature_batch)
-            latent_batch = latent_batch.to(dtype=unet.model.dtype)
-
-            # Predict and decode latent frames
-            pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
-            recon = vae.decode_latents(pred_latents)
-
-            for res_frame in recon:
+        # Thread to process frames (get landmarks, blend, etc.).
+        def process_frames():
+            count = 0
+            while count < total_chunks:
+                try:
+                    res_frame = res_frame_queue.get(timeout=1)
+                except queue.Empty:
+                    continue
                 bbox = self.coord_list_cycle[self.idx % len(self.coord_list_cycle)]
                 ori_frame = self.frame_list_cycle[self.idx % len(self.frame_list_cycle)].copy()
                 x1, y1, x2, y2 = bbox
-                res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                try:
+                    res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                except Exception as e:
+                    print(f"Error resizing frame: {e}")
+                    continue
                 mask = self.mask_list_cycle[self.idx % len(self.mask_list_cycle)]
                 mask_crop_box = self.mask_coords_list_cycle[self.idx % len(self.mask_coords_list_cycle)]
                 combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
-
-                # Write frame to video in-memory
-                video_writer.write(combined_frame)
+                raw_frame_queue.put(combined_frame)
                 self.idx += 1
+                count += 1
 
-        video_writer.release()
+        process_thread = threading.Thread(target=process_frames)
+        process_thread.start()
 
-        # Combine audio with the video
-        output_vid = os.path.join(self.video_out_path, out_vid_name + ".mp4")
-        cmd_combine_audio = (
-            f"ffmpeg -y -v warning -err_detect ignore_err -i {audio_path} -i {temp_video} "
-            f"-c:v copy -c:a aac -movflags +frag_keyframe+empty_moov -strict experimental {output_vid}"
-        )
-        os.system(cmd_combine_audio)
+        # Run inference in batches (populate res_frame_queue).
+        gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
+        for _, (whisper_batch, latent_batch) in enumerate(
+            tqdm(gen, total=int((total_chunks + self.batch_size - 1) / self.batch_size))
+        ):
+            audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
+            audio_feature_batch = pe(audio_feature_batch)
+            latent_batch = latent_batch.to(dtype=unet.model.dtype)
+            pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+            recon = vae.decode_latents(pred_latents)
+            for res_frame in recon:
+                res_frame_queue.put(res_frame)
+        process_thread.join()
+        print(f"Inference processing complete. Total time: {time.time() - start_time:.2f}s")
 
-        # Cleanup
-        os.remove(temp_video)
-        shutil.rmtree(tmp_dir)
-        print(f"Inference complete. Result saved to {output_vid}")
-        return output_vid
+        # Determine frame dimensions from the first frame.
+        first_frame = self.frame_list_cycle[0]
+        height, width, _ = first_frame.shape
 
+        # Setup ffmpeg command to encode raw frames to a fragmented MP4 stream.
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-f", "rawvideo",
+            "-pixel_format", "bgr24",
+            "-video_size", f"{width}x{height}",
+            "-framerate", str(fps),
+            "-i", "pipe:0",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4",
+            "pipe:1"
+        ]
+        ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+        # Thread to write raw frames into ffmpeg's stdin.
+        def write_frames():
+            while True:
+                try:
+                    frame = raw_frame_queue.get(timeout=1)
+                except queue.Empty:
+                    break
+                try:
+                    # Write the raw bytes (BGR order) of the frame.
+                    ffmpeg_process.stdin.write(frame.tobytes())
+                except Exception as e:
+                    print("Error writing frame to ffmpeg:", e)
+                    break
+            ffmpeg_process.stdin.close()
+
+        writer_thread = threading.Thread(target=write_frames)
+        writer_thread.start()
+
+        # Yield the ffmpeg output in chunks.
+        while True:
+            chunk = ffmpeg_process.stdout.read(8192)
+            if not chunk:
+                break
+            yield chunk
+
+        writer_thread.join()
+        ffmpeg_process.wait()
+        print("MSE streaming inference complete.")
+        
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
     """
     Returns an instance of Avatar based on the provided avatar_id.
