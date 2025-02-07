@@ -243,10 +243,12 @@ class Avatar:
             "-pixel_format", "bgr24",
             "-video_size", f"{width}x{height}",
             "-framerate", str(fps),
-            "-i", "pipe:0",
+            "-i", "pipe:0",          
+            "-i", audio_path,        
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-crf", "23",
+            "-c:a", "aac",
             "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
             "-f", "mp4",
             "pipe:1"
@@ -255,17 +257,27 @@ class Avatar:
 
         # Thread to write raw frames into ffmpeg's stdin.
         def write_frames():
+            last_frame = None
             while True:
                 try:
                     frame = raw_frame_queue.get(timeout=1)
+                    last_frame = frame
                 except queue.Empty:
                     break
                 try:
-                    # Write the raw bytes (BGR order) of the frame.
                     ffmpeg_process.stdin.write(frame.tobytes())
                 except Exception as e:
                     print("Error writing frame to ffmpeg:", e)
                     break
+            # After finishing, repeat the last frame for 5 seconds of video.
+            if last_frame is not None:
+                extra_frames = int(5 * fps)  # 5 seconds worth of frames
+                for _ in range(extra_frames):
+                    try:
+                        ffmpeg_process.stdin.write(last_frame.tobytes())
+                    except Exception as e:
+                        print("Error writing extra frame to ffmpeg:", e)
+                        break
             ffmpeg_process.stdin.close()
 
         writer_thread = threading.Thread(target=write_frames)
