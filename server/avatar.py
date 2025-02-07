@@ -269,9 +269,9 @@ class Avatar:
                 except Exception as e:
                     print("Error writing frame to ffmpeg:", e)
                     break
-            # After finishing, repeat the last frame for 5 seconds of video.
+            # After finishing, repeat the last frame for 1 seconds of video.
             if last_frame is not None:
-                extra_frames = int(5 * fps)  # 5 seconds worth of frames
+                extra_frames = int(1 * fps)  # 1 seconds worth of frames
                 for _ in range(extra_frames):
                     try:
                         ffmpeg_process.stdin.write(last_frame.tobytes())
