@@ -95,8 +95,8 @@ async def create_avatar_endpoint(
 # Endpoint to serve DASH files from the avatar's dash_output folder.
 @app.get("/dash/{avatar_id}/{file_path:path}")
 async def serve_dash_files(avatar_id: str, file_path: str):
-    dash_dir = Path(RESULTS_DIR) / avatar_id / "dash_output"
-    full_path = dash_dir / file_path
+    # Construct the full path by appending the provided file_path directly.
+    full_path = Path(RESULTS_DIR) / avatar_id / file_path
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found.")
     return FileResponse(str(full_path))
