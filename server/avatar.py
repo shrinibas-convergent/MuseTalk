@@ -263,19 +263,41 @@ class Avatar:
 
         def write_frames():
             last_frame = None
+            frame_count = 0
+            # Write all frames from the raw_frame_queue
             while True:
                 try:
                     frame = raw_frame_queue.get(timeout=1)
                     last_frame = frame
+                    frame_count += 1
+                    ffmpeg_process.stdin.write(frame.tobytes())
                 except queue.Empty:
                     break
-                try:
-                    ffmpeg_process.stdin.write(frame.tobytes())
-                except Exception as e:
-                    print("Error writing frame to ffmpeg:", e)
-                    break
+            try:
+                result = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        audio_path
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True
+                )
+                audio_duration = float(result.stdout.strip())
+            except Exception as e:
+                print("Error getting audio duration:", e)
+                audio_duration = 0
+
+            # Calculate the total expected frames for the audio duration.
+            expected_frames = int(round(audio_duration * fps))
+            extra_frames = max(0, expected_frames - frame_count)
+            print(f"Frame count: {frame_count}, expected: {expected_frames}, duplicating: {extra_frames} extra frames.")
+
             if last_frame is not None:
-                extra_frames = int(1 * fps)
                 for _ in range(extra_frames):
                     try:
                         ffmpeg_process.stdin.write(last_frame.tobytes())
