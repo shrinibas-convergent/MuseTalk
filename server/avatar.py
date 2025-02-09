@@ -248,6 +248,7 @@ class Avatar:
             "-i", "pipe:0",
             "-i", audio_path,
             "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",  # Force output pixel format to yuv420p
             "-preset", "veryfast",
             "-crf", "23",
             "-c:a", "aac",
