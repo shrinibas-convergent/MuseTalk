@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.background import BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from server.avatar import get_or_create_avatar
-from server.config import DEFAULT_VIDEO_PATH, DEFAULT_BBOX_SHIFT, DEFAULT_BATCH_SIZE, DEFAULT_FPS, TEMP_DIR
+from server.config import DEFAULT_VIDEO_PATH, DEFAULT_BBOX_SHIFT, DEFAULT_BATCH_SIZE, DEFAULT_FPS, TEMP_DIR, RESULTS_DIR
 from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 import shutil
