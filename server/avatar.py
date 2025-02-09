@@ -173,24 +173,24 @@ class Avatar:
         torch.save(self.input_latent_list_cycle, self.latents_out_path)
         print("Avatar preparation complete.")
 
-    def inference_mse(self, audio_path, fps):
+    def inference_dash(self, audio_path, fps, unique_id):
         """
-        Process the given audio file and generate a fragmented MP4 stream (suitable for Media Source Extensions).
-        Yields chunks of the MP4 stream.
+        Process the given audio file and generate MPEG-DASH output.
+        DASH segments and an MPD manifest are written to a unique subfolder under the avatar's dash_output folder.
+        Returns the path to the manifest file.
         """
-        print("Starting MSE streaming inference ...")
+        print("Starting DASH streaming inference ...")
         start_time = time.time()
-        # Extract audio features and divide audio into chunks.
+
+        # Run inference as before to populate frames.
         whisper_feature = audio_processor.audio2feat(audio_path)
         whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
         total_chunks = len(whisper_chunks)
         res_frame_queue = queue.Queue()
         self.idx = 0
 
-        # This queue will hold the final blended frames to be sent to ffmpeg.
         raw_frame_queue = queue.Queue()
 
-        # Thread to process frames (get landmarks, blend, etc.).
         def process_frames():
             count = 0
             while count < total_chunks:
@@ -216,7 +216,6 @@ class Avatar:
         process_thread = threading.Thread(target=process_frames)
         process_thread.start()
 
-        # Run inference in batches (populate res_frame_queue).
         gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
         for _, (whisper_batch, latent_batch) in enumerate(
             tqdm(gen, total=int((total_chunks + self.batch_size - 1) / self.batch_size))
@@ -231,11 +230,14 @@ class Avatar:
         process_thread.join()
         print(f"Inference processing complete. Total time: {time.time() - start_time:.2f}s")
 
-        # Determine frame dimensions from the first frame.
         first_frame = self.frame_list_cycle[0]
         height, width, _ = first_frame.shape
 
-        # Setup ffmpeg command to encode raw frames to a fragmented MP4 stream.
+        # Create a unique dash output directory for this request.
+        dash_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
+        os.makedirs(dash_dir, exist_ok=True)
+        manifest_path = os.path.join(dash_dir, "manifest.mpd")
+
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",
@@ -243,19 +245,21 @@ class Avatar:
             "-pixel_format", "bgr24",
             "-video_size", f"{width}x{height}",
             "-framerate", str(fps),
-            "-i", "pipe:0",          
-            "-i", audio_path,        
+            "-i", "pipe:0",
+            "-i", audio_path,
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-crf", "23",
             "-c:a", "aac",
-            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-            "-f", "mp4",
-            "pipe:1"
+            "-f", "dash",
+            "-use_template", "1",
+            "-use_timeline", "1",
+            "-seg_duration", "2",
+            manifest_path
         ]
-        ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        print("Running ffmpeg for DASH output:", " ".join(ffmpeg_cmd))
+        ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
-        # Thread to write raw frames into ffmpeg's stdin.
         def write_frames():
             last_frame = None
             while True:
@@ -269,9 +273,8 @@ class Avatar:
                 except Exception as e:
                     print("Error writing frame to ffmpeg:", e)
                     break
-            # After finishing, repeat the last frame for 1 seconds of video.
             if last_frame is not None:
-                extra_frames = int(1 * fps)  # 1 seconds worth of frames
+                extra_frames = int(1 * fps)
                 for _ in range(extra_frames):
                     try:
                         ffmpeg_process.stdin.write(last_frame.tobytes())
@@ -282,18 +285,11 @@ class Avatar:
 
         writer_thread = threading.Thread(target=write_frames)
         writer_thread.start()
-
-        # Yield the ffmpeg output in chunks.
-        while True:
-            chunk = ffmpeg_process.stdout.read(8192)
-            if not chunk:
-                break
-            yield chunk
-
         writer_thread.join()
         ffmpeg_process.wait()
-        print("MSE streaming inference complete.")
-        
+        print("DASH streaming inference complete.")
+        return manifest_path
+
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
     """
     Returns an instance of Avatar based on the provided avatar_id.
