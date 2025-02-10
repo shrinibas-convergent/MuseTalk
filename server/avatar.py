@@ -49,7 +49,6 @@ class Avatar:
         }
         self.preparation = preparation
         self.batch_size = batch_size
-        self.idx = 0
         self.init()
 
     def init(self):
@@ -187,46 +186,59 @@ class Avatar:
         whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
         total_chunks = len(whisper_chunks)
         res_frame_queue = queue.Queue()
-        self.idx = 0
-
+        # Use a local variable for concurrency isolation.
+        local_idx = 0
         raw_frame_queue = queue.Queue()
 
         def process_frames():
+            nonlocal local_idx
             count = 0
+            timeout_counter = 0
             while count < total_chunks:
                 try:
                     res_frame = res_frame_queue.get(timeout=1)
+                    timeout_counter = 0
                 except queue.Empty:
+                    timeout_counter += 1
+                    if timeout_counter >= 3:
+                        print("No frames received for 3 seconds, breaking process_frames loop.")
+                        break
                     continue
-                bbox = self.coord_list_cycle[self.idx % len(self.coord_list_cycle)]
-                ori_frame = self.frame_list_cycle[self.idx % len(self.frame_list_cycle)].copy()
+                bbox = self.coord_list_cycle[local_idx % len(self.coord_list_cycle)]
+                ori_frame = self.frame_list_cycle[local_idx % len(self.frame_list_cycle)].copy()
                 x1, y1, x2, y2 = bbox
                 try:
                     res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
                 except Exception as e:
                     print(f"Error resizing frame: {e}")
                     continue
-                mask = self.mask_list_cycle[self.idx % len(self.mask_list_cycle)]
-                mask_crop_box = self.mask_coords_list_cycle[self.idx % len(self.mask_coords_list_cycle)]
+                mask = self.mask_list_cycle[local_idx % len(self.mask_list_cycle)]
+                mask_crop_box = self.mask_coords_list_cycle[local_idx % len(self.mask_coords_list_cycle)]
                 combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
                 raw_frame_queue.put(combined_frame)
-                self.idx += 1
+                local_idx += 1
                 count += 1
 
         process_thread = threading.Thread(target=process_frames)
         process_thread.start()
 
-        gen = datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
-        for _, (whisper_batch, latent_batch) in enumerate(
-            tqdm(gen, total=int((total_chunks + self.batch_size - 1) / self.batch_size))
-        ):
-            audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
-            audio_feature_batch = pe(audio_feature_batch)
-            latent_batch = latent_batch.to(dtype=unet.model.dtype)
-            pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
-            recon = vae.decode_latents(pred_latents)
-            for res_frame in recon:
-                res_frame_queue.put(res_frame)
+        try:
+            for _, (whisper_batch, latent_batch) in enumerate(
+                tqdm(gen := datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size),
+                     total=int((total_chunks + self.batch_size - 1) / self.batch_size))
+            ):
+                try:
+                    audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
+                    audio_feature_batch = pe(audio_feature_batch)
+                    latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                    pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+                    recon = vae.decode_latents(pred_latents)
+                    for res_frame in recon:
+                        res_frame_queue.put(res_frame)
+                except Exception as e:
+                    print("Error during inference batch:", e)
+        except Exception as e:
+            print("Error iterating through datagen:", e)
         process_thread.join()
         print(f"Inference processing complete. Total time: {time.time() - start_time:.2f}s")
 
@@ -248,7 +260,7 @@ class Avatar:
             "-i", "pipe:0",
             "-i", audio_path,
             "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",  # Force output pixel format to yuv420p
+            "-pix_fmt", "yuv420p",
             "-preset", "veryfast",
             "-crf", "23",
             "-c:a", "aac",
@@ -259,7 +271,7 @@ class Avatar:
             manifest_path
         ]
         print("Running ffmpeg for DASH output:", " ".join(ffmpeg_cmd))
-        ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+        ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
         def write_frames():
             last_frame = None
@@ -271,6 +283,7 @@ class Avatar:
                     last_frame = frame
                     frame_count += 1
                     ffmpeg_process.stdin.write(frame.tobytes())
+                    ffmpeg_process.stdin.flush()
                 except queue.Empty:
                     break
             try:
@@ -296,7 +309,6 @@ class Avatar:
             expected_frames = int(round(audio_duration * fps))
             extra_frames = max(0, expected_frames - frame_count)
             print(f"Frame count: {frame_count}, expected: {expected_frames}, duplicating: {extra_frames} extra frames.")
-
             if last_frame is not None:
                 for _ in range(extra_frames):
                     try:
@@ -304,12 +316,19 @@ class Avatar:
                     except Exception as e:
                         print("Error writing extra frame to ffmpeg:", e)
                         break
-            ffmpeg_process.stdin.close()
+            try:
+                ffmpeg_process.stdin.close()
+            except Exception as e:
+                print("Error closing ffmpeg stdin:", e)
+            print("Writer thread finished.")
 
         writer_thread = threading.Thread(target=write_frames)
         writer_thread.start()
         writer_thread.join()
         ffmpeg_process.wait()
+        stderr_output = ffmpeg_process.stderr.read()
+        if stderr_output:
+            print("FFmpeg error output:", stderr_output.decode())
         print("DASH streaming inference complete.")
         return manifest_path
 
