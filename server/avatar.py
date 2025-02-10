@@ -25,6 +25,10 @@ from server.model import audio_processor, vae, unet, pe, device, timesteps
 # Import configuration defaults
 from server.config import DEFAULT_BATCH_SIZE, RESULTS_DIR
 
+# Global semaphore to limit concurrent inference requests.
+# Adjust the value as needed (here 1 means only one inference at a time).
+inference_semaphore = threading.Semaphore(1)
+
 def osmakedirs(path_list):
     for path in path_list:
         os.makedirs(path, exist_ok=True)
@@ -178,159 +182,164 @@ class Avatar:
         DASH segments and an MPD manifest are written to a unique subfolder under the avatar's dash_output folder.
         Returns the path to the manifest file.
         """
-        print("Starting DASH streaming inference ...")
-        start_time = time.time()
+        # Limit concurrent inferences using a global semaphore.
+        with inference_semaphore:
+            print("Starting DASH streaming inference ...")
+            start_time = time.time()
 
-        # Run inference as before to populate frames.
-        whisper_feature = audio_processor.audio2feat(audio_path)
-        whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
-        total_chunks = len(whisper_chunks)
-        res_frame_queue = queue.Queue()
-        # Use a local variable for concurrency isolation.
-        local_idx = 0
-        raw_frame_queue = queue.Queue()
+            # Run inference as before to populate frames.
+            whisper_feature = audio_processor.audio2feat(audio_path)
+            whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
+            total_chunks = len(whisper_chunks)
+            res_frame_queue = queue.Queue()
+            # Use a local variable for concurrency isolation.
+            local_idx = 0
+            raw_frame_queue = queue.Queue()
 
-        def process_frames():
-            nonlocal local_idx
-            count = 0
-            timeout_counter = 0
-            while count < total_chunks:
-                try:
-                    res_frame = res_frame_queue.get(timeout=1)
-                    timeout_counter = 0
-                except queue.Empty:
-                    timeout_counter += 1
-                    if timeout_counter >= 3:
-                        print("No frames received for 3 seconds, breaking process_frames loop.")
-                        break
-                    continue
-                bbox = self.coord_list_cycle[local_idx % len(self.coord_list_cycle)]
-                ori_frame = self.frame_list_cycle[local_idx % len(self.frame_list_cycle)].copy()
-                x1, y1, x2, y2 = bbox
-                try:
-                    res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
-                except Exception as e:
-                    print(f"Error resizing frame: {e}")
-                    continue
-                mask = self.mask_list_cycle[local_idx % len(self.mask_list_cycle)]
-                mask_crop_box = self.mask_coords_list_cycle[local_idx % len(self.mask_coords_list_cycle)]
-                combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
-                raw_frame_queue.put(combined_frame)
-                local_idx += 1
-                count += 1
-
-        process_thread = threading.Thread(target=process_frames)
-        process_thread.start()
-
-        try:
-            for _, (whisper_batch, latent_batch) in enumerate(
-                tqdm(gen := datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size),
-                     total=int((total_chunks + self.batch_size - 1) / self.batch_size))
-            ):
-                try:
-                    audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
-                    audio_feature_batch = pe(audio_feature_batch)
-                    latent_batch = latent_batch.to(dtype=unet.model.dtype)
-                    pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
-                    recon = vae.decode_latents(pred_latents)
-                    for res_frame in recon:
-                        res_frame_queue.put(res_frame)
-                except Exception as e:
-                    print("Error during inference batch:", e)
-        except Exception as e:
-            print("Error iterating through datagen:", e)
-        process_thread.join()
-        print(f"Inference processing complete. Total time: {time.time() - start_time:.2f}s")
-
-        first_frame = self.frame_list_cycle[0]
-        height, width, _ = first_frame.shape
-
-        # Create a unique dash output directory for this request.
-        dash_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
-        os.makedirs(dash_dir, exist_ok=True)
-        manifest_path = os.path.join(dash_dir, "manifest.mpd")
-
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-f", "rawvideo",
-            "-pixel_format", "bgr24",
-            "-video_size", f"{width}x{height}",
-            "-framerate", str(fps),
-            "-i", "pipe:0",
-            "-i", audio_path,
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-f", "dash",
-            "-use_template", "1",
-            "-use_timeline", "1",
-            "-seg_duration", "2",
-            manifest_path
-        ]
-        print("Running ffmpeg for DASH output:", " ".join(ffmpeg_cmd))
-        ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        def write_frames():
-            last_frame = None
-            frame_count = 0
-            # Write all frames from the raw_frame_queue
-            while True:
-                try:
-                    frame = raw_frame_queue.get(timeout=1)
-                    last_frame = frame
-                    frame_count += 1
-                    ffmpeg_process.stdin.write(frame.tobytes())
-                    ffmpeg_process.stdin.flush()
-                except queue.Empty:
-                    break
-            try:
-                result = subprocess.run(
-                    [
-                        "ffprobe",
-                        "-v", "error",
-                        "-show_entries", "format=duration",
-                        "-of", "default=noprint_wrappers=1:nokey=1",
-                        audio_path
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=True
-                )
-                audio_duration = float(result.stdout.strip())
-            except Exception as e:
-                print("Error getting audio duration:", e)
-                audio_duration = 0
-
-            # Calculate the total expected frames for the audio duration.
-            expected_frames = int(round(audio_duration * fps))
-            extra_frames = max(0, expected_frames - frame_count)
-            print(f"Frame count: {frame_count}, expected: {expected_frames}, duplicating: {extra_frames} extra frames.")
-            if last_frame is not None:
-                for _ in range(extra_frames):
+            def process_frames():
+                nonlocal local_idx
+                count = 0
+                timeout_counter = 0
+                while count < total_chunks:
                     try:
-                        ffmpeg_process.stdin.write(last_frame.tobytes())
+                        res_frame = res_frame_queue.get(timeout=1)
+                        timeout_counter = 0
+                    except queue.Empty:
+                        timeout_counter += 1
+                        if timeout_counter >= 3:
+                            print("No frames received for 3 seconds, breaking process_frames loop.")
+                            break
+                        continue
+                    bbox = self.coord_list_cycle[local_idx % len(self.coord_list_cycle)]
+                    ori_frame = self.frame_list_cycle[local_idx % len(self.frame_list_cycle)].copy()
+                    x1, y1, x2, y2 = bbox
+                    try:
+                        res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
                     except Exception as e:
-                        print("Error writing extra frame to ffmpeg:", e)
-                        break
-            try:
-                ffmpeg_process.stdin.close()
-            except Exception as e:
-                print("Error closing ffmpeg stdin:", e)
-            print("Writer thread finished.")
+                        print(f"Error resizing frame: {e}")
+                        continue
+                    mask = self.mask_list_cycle[local_idx % len(self.mask_list_cycle)]
+                    mask_crop_box = self.mask_coords_list_cycle[local_idx % len(self.mask_coords_list_cycle)]
+                    combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
+                    raw_frame_queue.put(combined_frame)
+                    local_idx += 1
+                    count += 1
 
-        writer_thread = threading.Thread(target=write_frames)
-        writer_thread.start()
-        writer_thread.join()
-        ffmpeg_process.wait()
-        stderr_output = ffmpeg_process.stderr.read()
-        if stderr_output:
-            print("FFmpeg error output:", stderr_output.decode())
-        print("DASH streaming inference complete.")
-        return manifest_path
+            process_thread = threading.Thread(target=process_frames)
+            process_thread.start()
+
+            try:
+                # Wrap the model inference in torch.no_grad() to avoid storing gradients.
+                with torch.no_grad():
+                    for _, (whisper_batch, latent_batch) in enumerate(
+                        tqdm(gen := datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size),
+                             total=int((total_chunks + self.batch_size - 1) / self.batch_size))
+                    ):
+                        try:
+                            audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
+                            audio_feature_batch = pe(audio_feature_batch)
+                            latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                            pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+                            recon = vae.decode_latents(pred_latents)
+                            for res_frame in recon:
+                                res_frame_queue.put(res_frame)
+                        except Exception as e:
+                            print("Error during inference batch:", e)
+            except Exception as e:
+                print("Error iterating through datagen:", e)
+            process_thread.join()
+            print(f"Inference processing complete. Total time: {time.time() - start_time:.2f}s")
+
+            first_frame = self.frame_list_cycle[0]
+            height, width, _ = first_frame.shape
+
+            # Create a unique dash output directory for this request.
+            dash_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
+            os.makedirs(dash_dir, exist_ok=True)
+            manifest_path = os.path.join(dash_dir, "manifest.mpd")
+
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-f", "rawvideo",
+                "-pixel_format", "bgr24",
+                "-video_size", f"{width}x{height}",
+                "-framerate", str(fps),
+                "-i", "pipe:0",
+                "-i", audio_path,
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-f", "dash",
+                "-use_template", "1",
+                "-use_timeline", "1",
+                "-seg_duration", "2",
+                manifest_path
+            ]
+            print("Running ffmpeg for DASH output:", " ".join(ffmpeg_cmd))
+            ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            def write_frames():
+                last_frame = None
+                frame_count = 0
+                while True:
+                    try:
+                        frame = raw_frame_queue.get(timeout=1)
+                        last_frame = frame
+                        frame_count += 1
+                        ffmpeg_process.stdin.write(frame.tobytes())
+                        ffmpeg_process.stdin.flush()
+                    except queue.Empty:
+                        break
+                try:
+                    result = subprocess.run(
+                        [
+                            "ffprobe",
+                            "-v", "error",
+                            "-show_entries", "format=duration",
+                            "-of", "default=noprint_wrappers=1:nokey=1",
+                            audio_path
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=True
+                    )
+                    audio_duration = float(result.stdout.strip())
+                except Exception as e:
+                    print("Error getting audio duration:", e)
+                    audio_duration = 0
+                expected_frames = int(round(audio_duration * fps))
+                extra_frames = max(0, expected_frames - frame_count)
+                print(f"Frame count: {frame_count}, expected: {expected_frames}, duplicating: {extra_frames} extra frames.")
+                if last_frame is not None:
+                    for _ in range(extra_frames):
+                        try:
+                            ffmpeg_process.stdin.write(last_frame.tobytes())
+                        except Exception as e:
+                            print("Error writing extra frame to ffmpeg:", e)
+                            break
+                try:
+                    ffmpeg_process.stdin.close()
+                except Exception as e:
+                    print("Error closing ffmpeg stdin:", e)
+                print("Writer thread finished.")
+
+            writer_thread = threading.Thread(target=write_frames)
+            writer_thread.start()
+            writer_thread.join()
+            ffmpeg_process.wait()
+            stderr_output = ffmpeg_process.stderr.read()
+            if stderr_output:
+                print("FFmpeg error output:", stderr_output.decode())
+            print("DASH streaming inference complete.")
+
+            # Free GPU cache to reduce fragmentation after inference.
+            torch.cuda.empty_cache()
+
+            return manifest_path
 
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
     """
