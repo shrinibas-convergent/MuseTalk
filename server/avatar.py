@@ -258,6 +258,28 @@ class Avatar:
             os.makedirs(dash_dir, exist_ok=True)
             manifest_path = os.path.join(dash_dir, "manifest.mpd")
 
+            # Use ffprobe to get the duration of the provided audio file.
+            try:
+                result = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        audio_path
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True
+                )
+                audio_duration = float(result.stdout.strip())
+            except Exception as e:
+                print("Error getting audio duration:", e)
+                audio_duration = 0
+
+            # Build the ffmpeg command.
+            # Adding the '-shortest' option ensures that encoding stops when the audio ends.
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",
@@ -272,6 +294,7 @@ class Avatar:
                 "-preset", "veryfast",
                 "-crf", "23",
                 "-c:a", "aac",
+                "-shortest",
                 "-f", "dash",
                 "-use_template", "1",
                 "-use_timeline", "1",
@@ -293,34 +316,6 @@ class Avatar:
                         ffmpeg_process.stdin.flush()
                     except queue.Empty:
                         break
-                try:
-                    result = subprocess.run(
-                        [
-                            "ffprobe",
-                            "-v", "error",
-                            "-show_entries", "format=duration",
-                            "-of", "default=noprint_wrappers=1:nokey=1",
-                            audio_path
-                        ],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        check=True
-                    )
-                    audio_duration = float(result.stdout.strip())
-                except Exception as e:
-                    print("Error getting audio duration:", e)
-                    audio_duration = 0
-                expected_frames = int(round(audio_duration * fps))
-                extra_frames = max(0, expected_frames - frame_count)
-                print(f"Frame count: {frame_count}, expected: {expected_frames}, duplicating: {extra_frames} extra frames.")
-                if last_frame is not None:
-                    for _ in range(extra_frames):
-                        try:
-                            ffmpeg_process.stdin.write(last_frame.tobytes())
-                        except Exception as e:
-                            print("Error writing extra frame to ffmpeg:", e)
-                            break
                 try:
                     ffmpeg_process.stdin.close()
                 except Exception as e:
