@@ -54,13 +54,10 @@ async def lipsync_endpoint(
 
         video_path = Path("data/video") / f"{avatar_id}.mp4"
         avatar = await run_in_threadpool(get_or_create_avatar, avatar_id, video_path, bbox_shift, batch_size)
-
-        # Run the continuous sliding realtime inference.
-        manifest_path = await run_in_threadpool(avatar.inference_continuous_sliding_realtime, str(audio_temp_path), DEFAULT_FPS, unique_id)
-
+        # Run the realtime sliding-window inference that produces a dynamic DASH manifest.
+        manifest_path = await run_in_threadpool(avatar.inference_continuous_sliding_realtime_stream, str(audio_temp_path), DEFAULT_FPS, unique_id)
         background_tasks.add_task(cleanup_temp_files, [str(audio_temp_path)])
-
-        # Construct the manifest URL. The client will fetch this manifest via the /dash endpoint.
+        # Construct the manifest URL for the client.
         manifest_url = f"/dash/{avatar_id}/dash_output/{unique_id}/manifest.mpd"
         return JSONResponse(content={"manifest_url": manifest_url})
     except Exception as e:

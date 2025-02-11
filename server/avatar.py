@@ -165,28 +165,30 @@ class Avatar:
         torch.save(self.input_latent_list_cycle, self.latents_out_path)
         print("Avatar preparation complete.")
 
-    def inference_continuous_sliding_realtime(self, audio_path, fps, unique_id):
+    def inference_continuous_sliding_realtime_stream(self, audio_path, fps, unique_id):
         """
-        Implements a continuous, realtime inference pipeline using a sliding window.
-        - The full audio features are computed once.
-        - Overlapping sliding windows (e.g., a 5-second window with a 1-second step) are generated.
-        - For the first window, all frames are output; for subsequent windows, only the new 'step' frames are output.
-        - A producer thread processes each window and enqueues new frames into a thread-safe queue.
-        - A writer thread concurrently writes frames from the queue to FFmpeg's stdin.
-        - FFmpeg muxes these frames with the full audio (using -shortest) to produce a continuous DASH stream.
-        Returns the path to the generated MPD manifest.
+        Implements a continuous, realtime inference pipeline using a sliding window,
+        with a dynamic manifest (live DASH). The pipeline works as follows:
+          - Compute full audio features.
+          - Build overlapping sliding windows (e.g., 5-second window with a 1-second step).
+          - A producer thread processes each window and enqueues only new frames (all for the first window, then the last 'step' frames).
+          - FFmpeg is launched in live mode (-live 1) to mux these frames with the complete audio into DASH segments,
+            dynamically updating the MPD manifest.
+          - The function returns immediately (after the first window is processed) so that the manifest is available,
+            while the background threads continue processing.
+        Returns the manifest path.
         """
         with inference_semaphore:
             print("Starting continuous sliding realtime inference ...")
             start_time = time.time()
 
-            # Compute full audio features and non-overlapping base chunks.
+            # Compute full audio features and base chunks.
             whisper_feature = audio_processor.audio2feat(audio_path)
             base_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
             total_chunks = len(base_chunks)
-            # Set sliding window parameters.
-            window_size = 125   # e.g., 5 seconds at 25 FPS
-            step = 25           # e.g., 1 second step at 25 FPS
+            # Sliding window parameters.
+            window_size = 125   # 5 seconds * 25 FPS.
+            step = 25           # 1 second * 25 FPS.
             sliding_windows = []
             for start in range(0, total_chunks - window_size + 1, step):
                 sliding_windows.append(base_chunks[start: start + window_size])
@@ -207,9 +209,7 @@ class Avatar:
                             datagen(window_chunks, self.input_latent_list_cycle, self.batch_size)
                         ):
                             with torch.no_grad():
-                                audio_feature_batch = torch.from_numpy(whisper_batch).to(
-                                    device=unet.device, dtype=unet.model.dtype
-                                )
+                                audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
                                 audio_feature_batch = pe(audio_feature_batch)
                                 latent_batch = latent_batch.to(dtype=unet.model.dtype)
                                 pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
@@ -224,35 +224,18 @@ class Avatar:
                             frames_queue.put(frame)
                         first_window = False
                     else:
-                        # Enqueue only the new 'step' frames from each subsequent window.
-                        if len(window_frames) >= step:
-                            for frame in window_frames[-step:]:
-                                frames_queue.put(frame)
-                        else:
-                            for frame in window_frames:
-                                frames_queue.put(frame)
+                        for frame in window_frames[-step:]:
+                            frames_queue.put(frame)
                 print("Producer thread finished.")
 
-            # Writer thread: writes frames from the queue to FFmpeg's stdin.
-            def writer(ffmpeg_stdin):
-                while True:
-                    try:
-                        frame = frames_queue.get(timeout=1)
-                        try:
-                            ffmpeg_stdin.write(frame.astype(np.uint8).tobytes())
-                            ffmpeg_stdin.flush()
-                        except Exception as e:
-                            print("Error writing frame to ffmpeg:", e)
-                    except queue.Empty:
-                        if not producer_thread.is_alive():
-                            break
-                try:
-                    ffmpeg_stdin.close()
-                except Exception as e:
-                    print("Error closing ffmpeg stdin:", e)
-                print("Writer thread finished.")
+            producer_thread = threading.Thread(target=producer, daemon=True)
+            producer_thread.start()
 
-            # Start FFmpeg to mux video frames with the complete audio.
+            # Wait until the first window's frames are available.
+            while frames_queue.empty():
+                time.sleep(0.1)
+
+            # Start FFmpeg in live mode for dynamic DASH output.
             first_frame = self.frame_list_cycle[0]
             height, width, _ = first_frame.shape
             dash_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
@@ -261,6 +244,7 @@ class Avatar:
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",
+                "-live", "1",  # Enable live mode for dynamic manifest updates.
                 "-f", "rawvideo",
                 "-pixel_format", "bgr24",
                 "-video_size", f"{width}x{height}",
@@ -279,24 +263,34 @@ class Avatar:
                 "-seg_duration", "2",
                 manifest_path
             ]
-            print("Running ffmpeg for continuous DASH output:", " ".join(ffmpeg_cmd))
-            ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            print("Running ffmpeg for live DASH output:", " ".join(ffmpeg_cmd))
+            ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            producer_thread = threading.Thread(target=producer)
-            producer_thread.start()
-            writer_thread = threading.Thread(target=writer, args=(ffmpeg_process.stdin,))
+            def writer(ffmpeg_stdin):
+                while True:
+                    try:
+                        frame = frames_queue.get(timeout=1)
+                        try:
+                            ffmpeg_stdin.write(frame.astype(np.uint8).tobytes())
+                            ffmpeg_stdin.flush()
+                        except Exception as e:
+                            print("Error writing frame to ffmpeg:", e)
+                    except queue.Empty:
+                        if not producer_thread.is_alive():
+                            break
+                try:
+                    ffmpeg_stdin.close()
+                except Exception as e:
+                    print("Error closing ffmpeg stdin:", e)
+                print("Writer thread finished.")
+
+            writer_thread = threading.Thread(target=writer, args=(ffmpeg_process.stdin,), daemon=True)
             writer_thread.start()
 
-            producer_thread.join()
-            writer_thread.join()
-            ffmpeg_process.wait()
-            stderr_output = ffmpeg_process.stderr.read()
-            if stderr_output:
-                print("FFmpeg error output:", stderr_output.decode())
-            torch.cuda.empty_cache()
-            total_time = time.time() - start_time
-            print("Continuous sliding realtime inference complete. Total time:", total_time)
-            # Return only the manifest path.
+            # Return the manifest path immediately once the first window is processed.
+            total_time_initial = time.time() - start_time
+            print("Initial window processed. Returning manifest URL. (Initial processing time:", total_time_initial, "seconds)")
+            # Note: Background threads continue writing frames and updating the DASH output.
             return manifest_path
 
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
