@@ -195,10 +195,30 @@ class Avatar:
             num_windows = len(sliding_windows)
             print(f"Total sliding windows: {num_windows}")
 
-            # Create a thread-safe queue for new frames.
+            # Compute expected frames (for logging only; we will not halt based on count).
+            try:
+                result = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        audio_path
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True
+                )
+                audio_duration = float(result.stdout.strip())
+            except Exception as e:
+                print("Error getting audio duration:", e)
+                audio_duration = 0
+            expected_frames = int(round(audio_duration * fps))
+            print(f"Audio duration: {audio_duration} seconds, expected frames (for logging): {expected_frames}")
+
             frames_queue = queue.Queue()
 
-            # Producer thread: process each window and enqueue only new frames.
             def producer():
                 first_window = True
                 for w in tqdm(range(num_windows), desc="Processing sliding windows"):
@@ -209,7 +229,9 @@ class Avatar:
                             datagen(window_chunks, self.input_latent_list_cycle, self.batch_size)
                         ):
                             with torch.no_grad():
-                                audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
+                                audio_feature_batch = torch.from_numpy(whisper_batch).to(
+                                    device=unet.device, dtype=unet.model.dtype
+                                )
                                 audio_feature_batch = pe(audio_feature_batch)
                                 latent_batch = latent_batch.to(dtype=unet.model.dtype)
                                 pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
@@ -256,7 +278,6 @@ class Avatar:
                 "-preset", "veryfast",
                 "-crf", "23",
                 "-c:a", "aac",
-                "-shortest",
                 "-f", "dash",
                 "-use_template", "1",
                 "-use_timeline", "1",
@@ -266,17 +287,24 @@ class Avatar:
             print("Running ffmpeg for live DASH output:", " ".join(ffmpeg_cmd))
             ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
+            # Writer thread: continuously write frames to FFmpeg's stdin.
             def writer(ffmpeg_stdin):
+                idle_time = 0
                 while True:
-                    try:
+                    try :
                         frame = frames_queue.get(timeout=1)
                         try:
                             ffmpeg_stdin.write(frame.astype(np.uint8).tobytes())
                             ffmpeg_stdin.flush()
-                        except Exception as e:
-                            print("Error writing frame to ffmpeg:", e)
+                            idle_time = 0  # Reset idle counter on successful write.
+                        except BrokenPipeError:
+                            print("FFmpeg pipe closed. Exiting writer thread gracefully.")
+                            break
                     except queue.Empty:
-                        if not producer_thread.is_alive():
+                        idle_time += 1
+                        # If no frames for 3 seconds and producer is finished, exit.
+                        if idle_time >= 3 and not producer_thread.is_alive():
+                            print("No new frames for 3 seconds and producer finished. Exiting writer thread.")
                             break
                 try:
                     ffmpeg_stdin.close()
@@ -290,7 +318,7 @@ class Avatar:
             # Return the manifest path immediately once the first window is processed.
             total_time_initial = time.time() - start_time
             print("Initial window processed. Returning manifest URL. (Initial processing time:", total_time_initial, "seconds)")
-            # Note: Background threads continue writing frames and updating the DASH output.
+            # Background threads continue processing in the background.
             return manifest_path
 
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
