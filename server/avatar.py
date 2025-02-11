@@ -26,7 +26,6 @@ from server.model import audio_processor, vae, unet, pe, device, timesteps
 from server.config import DEFAULT_BATCH_SIZE, RESULTS_DIR
 
 # Global semaphore to limit concurrent inference requests.
-# Adjust the value as needed (here 1 means only one inference at a time).
 inference_semaphore = threading.Semaphore(1)
 
 def osmakedirs(path_list):
@@ -56,7 +55,6 @@ class Avatar:
         self.init()
 
     def init(self):
-        # If preparation is requested and the avatar already exists, try to load it.
         if self.preparation:
             if os.path.exists(self.avatar_path):
                 print(f"Avatar {self.avatar_id} exists. Using existing data.")
@@ -80,7 +78,6 @@ class Avatar:
                 except Exception as e:
                     print(f"Error loading existing avatar, recreating it: {e}")
                     shutil.rmtree(self.avatar_path)
-
             print(f"Creating avatar: {self.avatar_id}")
             osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
             self.prepare_material()
@@ -118,8 +115,6 @@ class Avatar:
         print("Preparing avatar data materials ...")
         with open(self.avatar_info_path, "w") as f:
             json.dump(self.avatar_info, f)
-
-        # If video_path is a file, extract frames.
         if os.path.isfile(self.video_path):
             cap = cv2.VideoCapture(self.video_path)
             count = 0
@@ -138,7 +133,6 @@ class Avatar:
                     os.path.join(self.video_path, filename),
                     os.path.join(self.full_imgs_path, filename)
                 )
-
         input_img_list = sorted(glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')))
         print("Extracting landmarks ...")
         coord_list, frame_list = get_landmark_and_bbox(input_img_list, self.bbox_shift)
@@ -152,15 +146,11 @@ class Avatar:
             resized_crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
             latents = vae.get_latents_for_unet(resized_crop_frame)
             input_latent_list.append(latents)
-
-        # Create a cycle by mirroring the lists.
         self.frame_list_cycle = frame_list + frame_list[::-1]
         self.coord_list_cycle = coord_list + coord_list[::-1]
         self.input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
         self.mask_coords_list_cycle = []
         self.mask_list_cycle = []
-
-        # For simplicity, we use a grayscale version of the frame as the mask.
         for i, frame in enumerate(frame_list + frame_list[::-1]):
             cv2.imwrite(os.path.join(self.full_imgs_path, f"{i:08d}.png"), frame)
             mask = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -168,7 +158,6 @@ class Avatar:
             cv2.imwrite(os.path.join(self.mask_out_path, f"{i:08d}.png"), mask)
             self.mask_coords_list_cycle.append(crop_box)
             self.mask_list_cycle.append(mask)
-
         with open(self.mask_coords_path, 'wb') as f:
             pickle.dump(self.mask_coords_list_cycle, f)
         with open(self.coords_path, 'wb') as f:
@@ -176,110 +165,99 @@ class Avatar:
         torch.save(self.input_latent_list_cycle, self.latents_out_path)
         print("Avatar preparation complete.")
 
-    def inference_dash(self, audio_path, fps, unique_id):
+    def inference_continuous_sliding_realtime(self, audio_path, fps, unique_id):
         """
-        Process the given audio file and generate MPEG-DASH output.
-        DASH segments and an MPD manifest are written to a unique subfolder under the avatar's dash_output folder.
-        Returns the path to the manifest file.
+        Implements a continuous, realtime inference pipeline using a sliding window.
+        - The full audio features are computed once.
+        - Overlapping sliding windows (e.g., a 5-second window with a 1-second step) are generated.
+        - For the first window, all frames are output; for subsequent windows, only the new 'step' frames are output.
+        - A producer thread processes each window and enqueues new frames into a thread-safe queue.
+        - A writer thread concurrently writes frames from the queue to FFmpeg's stdin.
+        - FFmpeg muxes these frames with the full audio (using -shortest) to produce a continuous DASH stream.
+        Returns the path to the generated MPD manifest.
         """
-        # Limit concurrent inferences using a global semaphore.
         with inference_semaphore:
-            print("Starting DASH streaming inference ...")
+            print("Starting continuous sliding realtime inference ...")
             start_time = time.time()
 
-            # Run inference as before to populate frames.
+            # Compute full audio features and non-overlapping base chunks.
             whisper_feature = audio_processor.audio2feat(audio_path)
-            whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
-            total_chunks = len(whisper_chunks)
-            res_frame_queue = queue.Queue()
-            # Use a local variable for concurrency isolation.
-            local_idx = 0
-            raw_frame_queue = queue.Queue()
+            base_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
+            total_chunks = len(base_chunks)
+            # Set sliding window parameters.
+            window_size = 125   # e.g., 5 seconds at 25 FPS
+            step = 25           # e.g., 1 second step at 25 FPS
+            sliding_windows = []
+            for start in range(0, total_chunks - window_size + 1, step):
+                sliding_windows.append(base_chunks[start: start + window_size])
+            num_windows = len(sliding_windows)
+            print(f"Total sliding windows: {num_windows}")
 
-            def process_frames():
-                nonlocal local_idx
-                count = 0
-                timeout_counter = 0
-                while count < total_chunks:
+            # Create a thread-safe queue for new frames.
+            frames_queue = queue.Queue()
+
+            # Producer thread: process each window and enqueue only new frames.
+            def producer():
+                first_window = True
+                for w in tqdm(range(num_windows), desc="Processing sliding windows"):
+                    window_chunks = sliding_windows[w]
+                    window_frames = []
                     try:
-                        res_frame = res_frame_queue.get(timeout=1)
-                        timeout_counter = 0
-                    except queue.Empty:
-                        timeout_counter += 1
-                        if timeout_counter >= 3:
-                            print("No frames received for 3 seconds, breaking process_frames loop.")
-                            break
-                        continue
-                    bbox = self.coord_list_cycle[local_idx % len(self.coord_list_cycle)]
-                    ori_frame = self.frame_list_cycle[local_idx % len(self.frame_list_cycle)].copy()
-                    x1, y1, x2, y2 = bbox
-                    try:
-                        res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                        for _, (whisper_batch, latent_batch) in enumerate(
+                            datagen(window_chunks, self.input_latent_list_cycle, self.batch_size)
+                        ):
+                            with torch.no_grad():
+                                audio_feature_batch = torch.from_numpy(whisper_batch).to(
+                                    device=unet.device, dtype=unet.model.dtype
+                                )
+                                audio_feature_batch = pe(audio_feature_batch)
+                                latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                                pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+                                recon = vae.decode_latents(pred_latents)
+                                for frame in recon:
+                                    window_frames.append(frame)
                     except Exception as e:
-                        print(f"Error resizing frame: {e}")
+                        print(f"Error processing sliding window {w}: {e}")
                         continue
-                    mask = self.mask_list_cycle[local_idx % len(self.mask_list_cycle)]
-                    mask_crop_box = self.mask_coords_list_cycle[local_idx % len(self.mask_coords_list_cycle)]
-                    combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
-                    raw_frame_queue.put(combined_frame)
-                    local_idx += 1
-                    count += 1
+                    if first_window:
+                        for frame in window_frames:
+                            frames_queue.put(frame)
+                        first_window = False
+                    else:
+                        # Enqueue only the new 'step' frames from each subsequent window.
+                        if len(window_frames) >= step:
+                            for frame in window_frames[-step:]:
+                                frames_queue.put(frame)
+                        else:
+                            for frame in window_frames:
+                                frames_queue.put(frame)
+                print("Producer thread finished.")
 
-            process_thread = threading.Thread(target=process_frames)
-            process_thread.start()
-
-            try:
-                # Wrap the model inference in torch.no_grad() to avoid storing gradients.
-                with torch.no_grad():
-                    for _, (whisper_batch, latent_batch) in enumerate(
-                        tqdm(gen := datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size),
-                             total=int((total_chunks + self.batch_size - 1) / self.batch_size))
-                    ):
+            # Writer thread: writes frames from the queue to FFmpeg's stdin.
+            def writer(ffmpeg_stdin):
+                while True:
+                    try:
+                        frame = frames_queue.get(timeout=1)
                         try:
-                            audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
-                            audio_feature_batch = pe(audio_feature_batch)
-                            latent_batch = latent_batch.to(dtype=unet.model.dtype)
-                            pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
-                            recon = vae.decode_latents(pred_latents)
-                            for res_frame in recon:
-                                res_frame_queue.put(res_frame)
+                            ffmpeg_stdin.write(frame.astype(np.uint8).tobytes())
+                            ffmpeg_stdin.flush()
                         except Exception as e:
-                            print("Error during inference batch:", e)
-            except Exception as e:
-                print("Error iterating through datagen:", e)
-            process_thread.join()
-            print(f"Inference processing complete. Total time: {time.time() - start_time:.2f}s")
+                            print("Error writing frame to ffmpeg:", e)
+                    except queue.Empty:
+                        if not producer_thread.is_alive():
+                            break
+                try:
+                    ffmpeg_stdin.close()
+                except Exception as e:
+                    print("Error closing ffmpeg stdin:", e)
+                print("Writer thread finished.")
 
+            # Start FFmpeg to mux video frames with the complete audio.
             first_frame = self.frame_list_cycle[0]
             height, width, _ = first_frame.shape
-
-            # Create a unique dash output directory for this request.
             dash_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
             os.makedirs(dash_dir, exist_ok=True)
             manifest_path = os.path.join(dash_dir, "manifest.mpd")
-
-            # Use ffprobe to get the duration of the provided audio file.
-            try:
-                result = subprocess.run(
-                    [
-                        "ffprobe",
-                        "-v", "error",
-                        "-show_entries", "format=duration",
-                        "-of", "default=noprint_wrappers=1:nokey=1",
-                        audio_path
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=True
-                )
-                audio_duration = float(result.stdout.strip())
-            except Exception as e:
-                print("Error getting audio duration:", e)
-                audio_duration = 0
-
-            # Build the ffmpeg command.
-            # Adding the '-shortest' option ensures that encoding stops when the audio ends.
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",
@@ -301,39 +279,24 @@ class Avatar:
                 "-seg_duration", "2",
                 manifest_path
             ]
-            print("Running ffmpeg for DASH output:", " ".join(ffmpeg_cmd))
-            ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            print("Running ffmpeg for continuous DASH output:", " ".join(ffmpeg_cmd))
+            ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
 
-            def write_frames():
-                last_frame = None
-                frame_count = 0
-                while True:
-                    try:
-                        frame = raw_frame_queue.get(timeout=1)
-                        last_frame = frame
-                        frame_count += 1
-                        ffmpeg_process.stdin.write(frame.tobytes())
-                        ffmpeg_process.stdin.flush()
-                    except queue.Empty:
-                        break
-                try:
-                    ffmpeg_process.stdin.close()
-                except Exception as e:
-                    print("Error closing ffmpeg stdin:", e)
-                print("Writer thread finished.")
-
-            writer_thread = threading.Thread(target=write_frames)
+            producer_thread = threading.Thread(target=producer)
+            producer_thread.start()
+            writer_thread = threading.Thread(target=writer, args=(ffmpeg_process.stdin,))
             writer_thread.start()
+
+            producer_thread.join()
             writer_thread.join()
             ffmpeg_process.wait()
             stderr_output = ffmpeg_process.stderr.read()
             if stderr_output:
                 print("FFmpeg error output:", stderr_output.decode())
-            print("DASH streaming inference complete.")
-
-            # Free GPU cache to reduce fragmentation after inference.
             torch.cuda.empty_cache()
-
+            total_time = time.time() - start_time
+            print("Continuous sliding realtime inference complete. Total time:", total_time)
+            # Return only the manifest path.
             return manifest_path
 
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):

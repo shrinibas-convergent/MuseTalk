@@ -39,32 +39,28 @@ async def lipsync_endpoint(
 ):
     """
     Process lipsync by receiving form data and an audio file.
-    Generates DASH segments and returns the URL of the manifest.
-    This single endpoint supports multiple requests for the same avatar by isolating output using a unique identifier.
+    Generates a continuous DASH stream using a sliding window approach in realtime,
+    and returns a JSON response containing the URL of the DASH manifest.
     """
     try:
         if not avatar_id or not audio_file or not chunk:
             raise HTTPException(status_code=400, detail="'avatar_id', 'chunk', and 'audio_file' are required.")
 
-        # Generate a unique identifier using the chunk parameter and current timestamp.
         unique_id = f"{chunk}_{int(time.time())}"
-
-        # Save the uploaded audio file with a unique name.
         audio_temp_path = Path(TEMP_DIR) / f"{avatar_id}_{unique_id}_audio.wav"
         async with aiofiles.open(audio_temp_path, "wb") as f:
             content = await audio_file.read()
             await f.write(content)
 
-        # Assume the avatar video is stored in data/video/<avatar_id>.mp4.
         video_path = Path("data/video") / f"{avatar_id}.mp4"
         avatar = await run_in_threadpool(get_or_create_avatar, avatar_id, video_path, bbox_shift, batch_size)
 
-        # Run the DASH inference, which writes DASH segments and an MPD manifest into a unique subfolder.
-        manifest_path = await run_in_threadpool(avatar.inference_dash, str(audio_temp_path), DEFAULT_FPS, unique_id)
+        # Run the continuous sliding realtime inference.
+        manifest_path = await run_in_threadpool(avatar.inference_continuous_sliding_realtime, str(audio_temp_path), DEFAULT_FPS, unique_id)
 
         background_tasks.add_task(cleanup_temp_files, [str(audio_temp_path)])
 
-        # Construct a URL for the manifest. This assumes the manifest is served via the /dash endpoint.
+        # Construct the manifest URL. The client will fetch this manifest via the /dash endpoint.
         manifest_url = f"/dash/{avatar_id}/dash_output/{unique_id}/manifest.mpd"
         return JSONResponse(content={"manifest_url": manifest_url})
     except Exception as e:
@@ -92,10 +88,8 @@ async def create_avatar_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
-# Endpoint to serve DASH files from the avatar's dash_output folder.
 @app.get("/dash/{avatar_id}/{file_path:path}")
 async def serve_dash_files(avatar_id: str, file_path: str):
-    # Construct the full path by appending the provided file_path directly.
     full_path = Path(RESULTS_DIR) / avatar_id / file_path
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found.")
