@@ -1,4 +1,3 @@
-# http_api.py
 import os
 from pathlib import Path
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
@@ -15,7 +14,7 @@ import time
 app = FastAPI(title="MuseTalk HTTP Lipsync API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # Adjust allowed origins for production.
+    allow_origins=["*"],  # Adjust allowed origins for production.
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,21 +34,21 @@ async def lipsync_endpoint(
     bbox_shift: int = Form(DEFAULT_BBOX_SHIFT),
     batch_size: int = Form(DEFAULT_BATCH_SIZE),
     audio_file: UploadFile = File(...),
+    chunk_duration: float = Form(2),
     background_tasks: BackgroundTasks = None,
 ):
     """
     Process lipsync by receiving form data and an audio file.
-    Generates DASH segments and returns the URL of the manifest.
-    This single endpoint supports multiple requests for the same avatar by isolating output using a unique identifier.
+    Splits the audio into chunks (default 2 seconds each), runs inference on each,
+    muxes the corresponding video and audio chunks, and then starts live DASH streaming.
+    As soon as the first chunk is processed, the manifest URL is returned.
     """
     try:
         if not avatar_id or not audio_file or not chunk:
             raise HTTPException(status_code=400, detail="'avatar_id', 'chunk', and 'audio_file' are required.")
 
-        # Generate a unique identifier using the chunk parameter and current timestamp.
         unique_id = f"{chunk}_{int(time.time())}"
 
-        # Save the uploaded audio file with a unique name.
         audio_temp_path = Path(TEMP_DIR) / f"{avatar_id}_{unique_id}_audio.wav"
         async with aiofiles.open(audio_temp_path, "wb") as f:
             content = await audio_file.read()
@@ -59,12 +58,11 @@ async def lipsync_endpoint(
         video_path = Path("data/video") / f"{avatar_id}.mp4"
         avatar = await run_in_threadpool(get_or_create_avatar, avatar_id, video_path, bbox_shift, batch_size)
 
-        # Run the DASH inference, which writes DASH segments and an MPD manifest into a unique subfolder.
-        manifest_path = await run_in_threadpool(avatar.inference_dash, str(audio_temp_path), DEFAULT_FPS, unique_id)
+        manifest_path = await run_in_threadpool(
+            avatar.inference_dash, str(audio_temp_path), DEFAULT_FPS, unique_id, chunk_duration
+        )
 
         background_tasks.add_task(cleanup_temp_files, [str(audio_temp_path)])
-
-        # Construct a URL for the manifest. This assumes the manifest is served via the /dash endpoint.
         manifest_url = f"/dash/{avatar_id}/dash_output/{unique_id}/manifest.mpd"
         return JSONResponse(content={"manifest_url": manifest_url})
     except Exception as e:
@@ -95,7 +93,6 @@ async def create_avatar_endpoint(
 # Endpoint to serve DASH files from the avatar's dash_output folder.
 @app.get("/dash/{avatar_id}/{file_path:path}")
 async def serve_dash_files(avatar_id: str, file_path: str):
-    # Construct the full path by appending the provided file_path directly.
     full_path = Path(RESULTS_DIR) / avatar_id / file_path
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found.")

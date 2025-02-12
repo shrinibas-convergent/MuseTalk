@@ -1,4 +1,3 @@
-# avatar.py
 import os
 import cv2
 import json
@@ -24,9 +23,9 @@ from server.model import audio_processor, vae, unet, pe, device, timesteps
 
 # Import configuration defaults
 from server.config import DEFAULT_BATCH_SIZE, RESULTS_DIR
+DEFAULT_CHUNK_DURATION = 2
 
 # Global semaphore to limit concurrent inference requests.
-# Adjust the value as needed (here 1 means only one inference at a time).
 inference_semaphore = threading.Semaphore(1)
 
 def osmakedirs(path_list):
@@ -56,7 +55,6 @@ class Avatar:
         self.init()
 
     def init(self):
-        # If preparation is requested and the avatar already exists, try to load it.
         if self.preparation:
             if os.path.exists(self.avatar_path):
                 print(f"Avatar {self.avatar_id} exists. Using existing data.")
@@ -176,64 +174,93 @@ class Avatar:
         torch.save(self.input_latent_list_cycle, self.latents_out_path)
         print("Avatar preparation complete.")
 
-    def inference_dash(self, audio_path, fps, unique_id):
+    def inference_dash(self, audio_path, fps, unique_id, chunk_duration=DEFAULT_CHUNK_DURATION):
         """
-        Process the given audio file and generate MPEG-DASH output.
-        DASH segments and an MPD manifest are written to a unique subfolder under the avatar's dash_output folder.
-        Returns the path to the manifest file.
+        Process the given audio file in chunks.
+        For each audio chunk (of chunk_duration seconds), run inference to generate a video chunk,
+        mux that video with the corresponding audio chunk, and update a live DASH stream.
+        As soon as the first chunk is processed, the manifest URL is returned.
         """
-        # Limit concurrent inferences using a global semaphore.
         with inference_semaphore:
-            print("Starting DASH streaming inference ...")
+            print("Starting chunked DASH streaming inference ...")
             start_time = time.time()
 
-            # Run inference as before to populate frames.
-            whisper_feature = audio_processor.audio2feat(audio_path)
-            whisper_chunks = audio_processor.feature2chunks(feature_array=whisper_feature, fps=fps)
-            total_chunks = len(whisper_chunks)
-            res_frame_queue = queue.Queue()
-            # Use a local variable for concurrency isolation.
-            local_idx = 0
-            raw_frame_queue = queue.Queue()
+            # Create base directory for this request.
+            base_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
+            osmakedirs([base_dir])
+            audio_chunks_dir = os.path.join(base_dir, "audio_chunks")
+            video_chunks_dir = os.path.join(base_dir, "video_chunks")
+            segments_dir = os.path.join(base_dir, "segments")
+            osmakedirs([audio_chunks_dir, video_chunks_dir, segments_dir])
+            filelist_path = os.path.join(base_dir, "filelist.txt")
+            # Open filelist for appending segment paths.
+            filelist = open(filelist_path, "w")
 
-            def process_frames():
-                nonlocal local_idx
-                count = 0
-                timeout_counter = 0
-                while count < total_chunks:
-                    try:
-                        res_frame = res_frame_queue.get(timeout=1)
-                        timeout_counter = 0
-                    except queue.Empty:
-                        timeout_counter += 1
-                        if timeout_counter >= 3:
-                            print("No frames received for 3 seconds, breaking process_frames loop.")
+            # Split the input audio into chunks.
+            split_cmd = [
+                "ffmpeg",
+                "-y",
+                "-i", audio_path,
+                "-f", "segment",
+                "-segment_time", str(chunk_duration),
+                "-c", "copy",
+                os.path.join(audio_chunks_dir, "chunk_%03d.wav")
+            ]
+            subprocess.run(split_cmd, check=True)
+            audio_chunks = sorted(glob.glob(os.path.join(audio_chunks_dir, "chunk_*.wav")))
+            if not audio_chunks:
+                raise Exception("No audio chunks produced.")
+            print(f"Created {len(audio_chunks)} audio chunks.")
+
+            # Event to signal when the first chunk is processed.
+            first_chunk_event = threading.Event()
+            dash_started = threading.Event()
+
+            def append_to_filelist(segment_path):
+                filelist.write(f"file '{segment_path}'\n")
+                filelist.flush()
+
+            # Function to process a single chunk.
+            def process_chunk(i, audio_chunk):
+                print(f"Processing chunk {i+1}/{len(audio_chunks)}: {audio_chunk}")
+                # Compute features for current chunk.
+                whisper_feature = audio_processor.audio2feat(audio_chunk)
+                whisper_chunks = audio_processor.feature2chunks(whisper_feature, fps)
+                total_frames = len(whisper_chunks)
+                res_frame_queue = queue.Queue()
+                raw_frame_queue = queue.Queue()
+                local_idx = 0
+
+                def process_frames():
+                    nonlocal local_idx
+                    count = 0
+                    while count < total_frames:
+                        try:
+                            res_frame = res_frame_queue.get(timeout=1)
+                        except queue.Empty:
                             break
-                        continue
-                    bbox = self.coord_list_cycle[local_idx % len(self.coord_list_cycle)]
-                    ori_frame = self.frame_list_cycle[local_idx % len(self.frame_list_cycle)].copy()
-                    x1, y1, x2, y2 = bbox
-                    try:
-                        res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
-                    except Exception as e:
-                        print(f"Error resizing frame: {e}")
-                        continue
-                    mask = self.mask_list_cycle[local_idx % len(self.mask_list_cycle)]
-                    mask_crop_box = self.mask_coords_list_cycle[local_idx % len(self.mask_coords_list_cycle)]
-                    combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
-                    raw_frame_queue.put(combined_frame)
-                    local_idx += 1
-                    count += 1
+                        bbox = self.coord_list_cycle[local_idx % len(self.coord_list_cycle)]
+                        ori_frame = self.frame_list_cycle[local_idx % len(self.frame_list_cycle)].copy()
+                        x1, y1, x2, y2 = bbox
+                        try:
+                            res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                        except Exception as e:
+                            print(f"Error resizing frame: {e}")
+                            continue
+                        mask = self.mask_list_cycle[local_idx % len(self.mask_list_cycle)]
+                        mask_crop_box = self.mask_coords_list_cycle[local_idx % len(self.mask_coords_list_cycle)]
+                        combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
+                        raw_frame_queue.put(combined_frame)
+                        local_idx += 1
+                        count += 1
 
-            process_thread = threading.Thread(target=process_frames)
-            process_thread.start()
+                proc_thread = threading.Thread(target=process_frames)
+                proc_thread.start()
 
-            try:
-                # Wrap the model inference in torch.no_grad() to avoid storing gradients.
+                # Run inference over frames.
                 with torch.no_grad():
                     for _, (whisper_batch, latent_batch) in enumerate(
-                        tqdm(gen := datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size),
-                             total=int((total_chunks + self.batch_size - 1) / self.batch_size))
+                        datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
                     ):
                         try:
                             audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
@@ -245,97 +272,107 @@ class Avatar:
                                 res_frame_queue.put(res_frame)
                         except Exception as e:
                             print("Error during inference batch:", e)
-            except Exception as e:
-                print("Error iterating through datagen:", e)
-            process_thread.join()
-            print(f"Inference processing complete. Total time: {time.time() - start_time:.2f}s")
+                proc_thread.join()
 
-            first_frame = self.frame_list_cycle[0]
-            height, width, _ = first_frame.shape
+                # Write video chunk.
+                first_frame = self.frame_list_cycle[0]
+                height, width, _ = first_frame.shape
+                video_chunk_path = os.path.join(video_chunks_dir, f"video_chunk_{i:03d}.mp4")
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-f", "rawvideo",
+                    "-pixel_format", "bgr24",
+                    "-video_size", f"{width}x{height}",
+                    "-framerate", str(fps),
+                    "-i", "pipe:0",
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-preset", "veryfast",
+                    "-crf", "23",
+                    video_chunk_path
+                ]
+                ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            # Create a unique dash output directory for this request.
-            dash_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
-            os.makedirs(dash_dir, exist_ok=True)
-            manifest_path = os.path.join(dash_dir, "manifest.mpd")
-
-            # Use ffprobe to get the duration of the provided audio file.
-            try:
-                result = subprocess.run(
-                    [
-                        "ffprobe",
-                        "-v", "error",
-                        "-show_entries", "format=duration",
-                        "-of", "default=noprint_wrappers=1:nokey=1",
-                        audio_path
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=True
-                )
-                audio_duration = float(result.stdout.strip())
-            except Exception as e:
-                print("Error getting audio duration:", e)
-                audio_duration = 0
-
-            # Build the ffmpeg command.
-            # Adding the '-shortest' option ensures that encoding stops when the audio ends.
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-y",
-                "-f", "rawvideo",
-                "-pixel_format", "bgr24",
-                "-video_size", f"{width}x{height}",
-                "-framerate", str(fps),
-                "-i", "pipe:0",
-                "-i", audio_path,
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-preset", "veryfast",
-                "-crf", "23",
-                "-c:a", "aac",
-                "-shortest",
-                "-f", "dash",
-                "-use_template", "1",
-                "-use_timeline", "1",
-                "-seg_duration", "2",
-                manifest_path
-            ]
-            print("Running ffmpeg for DASH output:", " ".join(ffmpeg_cmd))
-            ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-            def write_frames():
-                last_frame = None
-                frame_count = 0
-                while True:
+                def write_frames():
+                    while True:
+                        try:
+                            frame = raw_frame_queue.get(timeout=1)
+                            ffmpeg_process.stdin.write(frame.tobytes())
+                        except queue.Empty:
+                            break
                     try:
-                        frame = raw_frame_queue.get(timeout=1)
-                        last_frame = frame
-                        frame_count += 1
-                        ffmpeg_process.stdin.write(frame.tobytes())
-                        ffmpeg_process.stdin.flush()
-                    except queue.Empty:
-                        break
-                try:
-                    ffmpeg_process.stdin.close()
-                except Exception as e:
-                    print("Error closing ffmpeg stdin:", e)
-                print("Writer thread finished.")
+                        ffmpeg_process.stdin.close()
+                    except Exception as e:
+                        print("Error closing ffmpeg stdin:", e)
 
-            writer_thread = threading.Thread(target=write_frames)
-            writer_thread.start()
-            writer_thread.join()
-            ffmpeg_process.wait()
-            stderr_output = ffmpeg_process.stderr.read()
-            if stderr_output:
-                print("FFmpeg error output:", stderr_output.decode())
-            print("DASH streaming inference complete.")
+                writer_thread = threading.Thread(target=write_frames)
+                writer_thread.start()
+                writer_thread.join()
+                ffmpeg_process.wait()
 
-            # Free GPU cache to reduce fragmentation after inference.
+                # Mux video chunk with corresponding audio chunk.
+                segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
+                mux_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i", video_chunk_path,
+                    "-i", audio_chunk,
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-shortest",
+                    segment_path
+                ]
+                subprocess.run(mux_cmd, check=True)
+                append_to_filelist(segment_path)
+                print(f"Segment {i:03d} created and appended.")
+                if i == 0:
+                    # Signal that the first chunk is processed.
+                    first_chunk_event.set()
+
+            # Function to start the live DASH stream.
+            def start_dash_stream():
+                first_chunk_event.wait()  # ensure at least one segment is ready
+                dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
+                dash_cmd = [
+                    "ffmpeg",
+                    "-re",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", filelist_path,
+                    "-c", "copy",
+                    "-f", "dash",
+                    "-live", "1",
+                    "-window_size", "5",
+                    "-extra_window_size", "5",
+                    dash_manifest_path
+                ]
+                print("Starting live DASH ffmpeg process...")
+                dash_process = subprocess.Popen(dash_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                dash_process.wait()
+                print("Live DASH streaming finished.")
+
+            # Start the DASH process thread.
+            dash_thread = threading.Thread(target=start_dash_stream, daemon=True)
+            dash_thread.start()
+
+            # Process the first chunk synchronously.
+            process_chunk(0, audio_chunks[0])
+            # At this point the first chunk is done and the event should be set.
+            first_chunk_event.wait()
+            # Launch background processing for remaining chunks.
+            def process_remaining():
+                for i in range(1, len(audio_chunks)):
+                    process_chunk(i, audio_chunks[i])
+                filelist.close()
+                print("All chunks processed.")
+            remaining_thread = threading.Thread(target=process_remaining, daemon=True)
+            remaining_thread.start()
+
+            print(f"Inference processing complete (first chunk). Total time so far: {time.time() - start_time:.2f}s")
             torch.cuda.empty_cache()
-
-            return manifest_path
-
+            return os.path.join(base_dir, "manifest.mpd")
+            
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
     """
     Returns an instance of Avatar based on the provided avatar_id.
