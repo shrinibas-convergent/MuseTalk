@@ -21,10 +21,9 @@ from musetalk.utils.utils import datagen
 # Import global models from model.py
 from server.model import audio_processor, vae, unet, pe, device, timesteps
 
-# Import configuration defaults and force absolute RESULTS_DIR
+# Import configuration defaults
 from server.config import DEFAULT_BATCH_SIZE, RESULTS_DIR
-RESULTS_DIR = os.path.abspath(RESULTS_DIR)
-DEFAULT_CHUNK_DURATION = 2
+DEFAULT_CHUNK_DURATION = 3
 
 # Global semaphore to limit concurrent inference requests.
 inference_semaphore = threading.Semaphore(1)
@@ -117,6 +116,8 @@ class Avatar:
         print("Preparing avatar data materials ...")
         with open(self.avatar_info_path, "w") as f:
             json.dump(self.avatar_info, f)
+
+        # If video_path is a file, extract frames.
         if os.path.isfile(self.video_path):
             cap = cv2.VideoCapture(self.video_path)
             count = 0
@@ -135,6 +136,7 @@ class Avatar:
                     os.path.join(self.video_path, filename),
                     os.path.join(self.full_imgs_path, filename)
                 )
+
         input_img_list = sorted(glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')))
         print("Extracting landmarks ...")
         coord_list, frame_list = get_landmark_and_bbox(input_img_list, self.bbox_shift)
@@ -148,11 +150,15 @@ class Avatar:
             resized_crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
             latents = vae.get_latents_for_unet(resized_crop_frame)
             input_latent_list.append(latents)
+
+        # Create a cycle by mirroring the lists.
         self.frame_list_cycle = frame_list + frame_list[::-1]
         self.coord_list_cycle = coord_list + coord_list[::-1]
         self.input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
         self.mask_coords_list_cycle = []
         self.mask_list_cycle = []
+
+        # For simplicity, we use a grayscale version of the frame as the mask.
         for i, frame in enumerate(frame_list + frame_list[::-1]):
             cv2.imwrite(os.path.join(self.full_imgs_path, f"{i:08d}.png"), frame)
             mask = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -160,6 +166,7 @@ class Avatar:
             cv2.imwrite(os.path.join(self.mask_out_path, f"{i:08d}.png"), mask)
             self.mask_coords_list_cycle.append(crop_box)
             self.mask_list_cycle.append(mask)
+
         with open(self.mask_coords_path, 'wb') as f:
             pickle.dump(self.mask_coords_list_cycle, f)
         with open(self.coords_path, 'wb') as f:
@@ -171,35 +178,22 @@ class Avatar:
         """
         Process the given audio file in chunks.
         For each audio chunk (of chunk_duration seconds), run inference to generate a video chunk,
-        mux that video with the corresponding audio chunk.
-        Meanwhile, update the DASH manifest by waiting for each expected segment file
-        (segment_000.mp4, segment_001.mp4, etc.) using a counter.
-        When updating the manifest, repackage the concatenated segments using a dash command
-        modeled after your example:
-        
-        ffmpeg -re -i <input> -map 0 -map 0 -c:a libfdk_aac -c:v libx264 \
-            -b:v:0 800k -b:v:1 300k -s:v:1 320x170 -profile:v:1 baseline \
-            -profile:v:0 main -bf 1 -keyint_min 120 -g 120 -sc_threshold 0 \
-            -b_strategy 0 -ar:a:1 22050 -use_timeline 1 -use_template 1 \
-            -window_size 5 -adaptation_sets "id=0,streams=v id=1,streams=a" \
-            -f dash /path/to/out.mpd
-        
-        This command is built as a string and run with shell=True.
-        As soon as the first chunk is processed, return the manifest URL.
+        mux that video with the corresponding audio chunk, and update a live DASH stream.
+        As soon as the first chunk is processed, the manifest URL is returned.
         """
         with inference_semaphore:
             print("Starting chunked DASH streaming inference ...")
             start_time = time.time()
 
-            base_dir = os.path.abspath(os.path.join(RESULTS_DIR, self.avatar_id, "dash_output", unique_id))
+            # Create base directory for this request.
+            base_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
             osmakedirs([base_dir])
             audio_chunks_dir = os.path.join(base_dir, "audio_chunks")
             video_chunks_dir = os.path.join(base_dir, "video_chunks")
             segments_dir = os.path.join(base_dir, "segments")
             osmakedirs([audio_chunks_dir, video_chunks_dir, segments_dir])
-            print("Base directory:", base_dir)
-            print("Segments directory:", segments_dir)
 
+            # Split the input audio into chunks.
             split_cmd = [
                 "ffmpeg",
                 "-y",
@@ -215,11 +209,13 @@ class Avatar:
                 raise Exception("No audio chunks produced.")
             print(f"Created {len(audio_chunks)} audio chunks.")
 
+            # Events for synchronization.
             first_chunk_event = threading.Event()
             all_segments_event = threading.Event()
 
             def process_chunk(i, audio_chunk):
                 print(f"Processing chunk {i+1}/{len(audio_chunks)}: {audio_chunk}")
+                # Compute features for the current chunk.
                 whisper_feature = audio_processor.audio2feat(audio_chunk)
                 whisper_chunks = audio_processor.feature2chunks(whisper_feature, fps)
                 total_frames = len(whisper_chunks)
@@ -258,7 +254,9 @@ class Avatar:
                         datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
                     ):
                         try:
-                            audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
+                            audio_feature_batch = torch.from_numpy(whisper_batch).to(
+                                device=unet.device, dtype=unet.model.dtype
+                            )
                             audio_feature_batch = pe(audio_feature_batch)
                             latent_batch = latent_batch.to(dtype=unet.model.dtype)
                             pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
@@ -269,6 +267,7 @@ class Avatar:
                             print("Error during inference batch:", e)
                 proc_thread.join()
 
+                # Write video chunk.
                 first_frame = self.frame_list_cycle[0]
                 height, width, _ = first_frame.shape
                 video_chunk_path = os.path.join(video_chunks_dir, f"video_chunk_{i:03d}.mp4")
@@ -287,6 +286,7 @@ class Avatar:
                     video_chunk_path
                 ]
                 ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
                 def write_frames():
                     while True:
                         try:
@@ -298,11 +298,13 @@ class Avatar:
                         ffmpeg_process.stdin.close()
                     except Exception as e:
                         print("Error closing ffmpeg stdin:", e)
+
                 writer_thread = threading.Thread(target=write_frames)
                 writer_thread.start()
                 writer_thread.join()
                 ffmpeg_process.wait()
 
+                # Mux the video chunk with the corresponding audio chunk.
                 segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
                 mux_cmd = [
                     "ffmpeg",
@@ -315,69 +317,47 @@ class Avatar:
                     segment_path
                 ]
                 subprocess.run(mux_cmd, check=True)
-                print(f"Segment {i:03d} created: {segment_path}")
+                print(f"Segment {i:03d} created.")
                 if i == 0:
                     first_chunk_event.set()
 
-            def update_manifest_by_counter():
+            # Function to update the DASH manifest periodically.
+            def update_manifest_loop():
                 dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
-                temp_filelist = os.path.join(base_dir, "temp_filelist.txt")
-                counter = 0
-                collected_segments = []
-                # Create an empty file list.
-                with open(temp_filelist, "w") as f:
-                    pass
+                # Use an absolute glob pattern.
+                segments_pattern = os.path.join(os.path.abspath(segments_dir), "segment_*.mp4")
+                dash_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-re",
+                    "-pattern_type", "glob",
+                    "-i", segments_pattern,
+                    "-c", "copy",
+                    "-f", "dash",
+                    "-use_template", "1",
+                    "-use_timeline", "1",
+                    "-seg_duration", str(chunk_duration),
+                    "-live", "1",
+                    "-window_size", "5",
+                    "-extra_window_size", "5",
+                    dash_manifest_path
+                ]
                 while not all_segments_event.is_set():
-                    expected_seg = os.path.join(segments_dir, f"segment_{counter:03d}.mp4")
-                    print(f"Waiting for expected segment: {expected_seg}")
-                    while not os.path.exists(expected_seg):
-                        if all_segments_event.is_set():
-                            break
-                        time.sleep(1)
-                    if not os.path.exists(expected_seg):
-                        break
-                    print(f"Found segment: {expected_seg}")
-                    collected_segments.append(expected_seg)
-                    with open(temp_filelist, "w") as f:
-                        for seg in collected_segments:
-                            f.write(f"file '{os.path.abspath(seg)}'\n")
-                    # Build the ffmpeg DASH command string.
-                    dash_cmd = (
-                        "ffmpeg -re -i {input} -map 0 -map 0 "
-                        "-c:a libfdk_aac -c:v libx264 "
-                        "-b:v:0 800k -b:v:1 300k -s:v:1 320x170 -profile:v:1 baseline "
-                        "-profile:v:0 main -bf 1 -keyint_min 120 -g 120 -sc_threshold 0 "
-                        "-b_strategy 0 -ar:a:1 22050 "
-                        "-use_timeline 1 -use_template 1 -window_size 5 "
-                        "-adaptation_sets \"id=0,streams=v id=1,streams=a\" "
-                        "-mpd_flags live -f dash {manifest}"
-                    ).format(input=temp_filelist, manifest=dash_manifest_path)
-                    print("Running DASH command:")
-                    print(dash_cmd)
-                    subprocess.run(dash_cmd, shell=True)
-                    counter += 1
-                with open(temp_filelist, "w") as f:
-                    for seg in collected_segments:
-                        f.write(f"file '{os.path.abspath(seg)}'\n")
-                dash_cmd = (
-                    "ffmpeg -re -i {input} -map 0 -map 0 "
-                    "-c:a libfdk_aac -c:v libx264 "
-                    "-b:v:0 800k -b:v:1 300k -s:v:1 320x170 -profile:v:1 baseline "
-                    "-profile:v:0 main -bf 1 -keyint_min 120 -g 120 -sc_threshold 0 "
-                    "-b_strategy 0 -ar:a:1 22050 "
-                    "-use_timeline 1 -use_template 1 -window_size 5 "
-                    "-adaptation_sets \"id=0,streams=v id=1,streams=a\" "
-                    "-mpd_flags live -f dash {manifest}"
-                ).format(input=temp_filelist, manifest=dash_manifest_path)
-                subprocess.run(dash_cmd, shell=True)
-                print("Final manifest update complete.")
+                    print("Updating manifest...")
+                    subprocess.run(dash_cmd)
+                    time.sleep(2)
+                print("Final manifest update...")
+                subprocess.run(dash_cmd)
 
-            manifest_thread = threading.Thread(target=update_manifest_by_counter, daemon=True)
+            # Start the manifest update thread.
+            manifest_thread = threading.Thread(target=update_manifest_loop, daemon=True)
             manifest_thread.start()
 
+            # Process the first chunk synchronously.
             process_chunk(0, audio_chunks[0])
             first_chunk_event.wait()
 
+            # Process remaining chunks in background.
             def process_remaining():
                 for i in range(1, len(audio_chunks)):
                     process_chunk(i, audio_chunks[i])
@@ -386,11 +366,15 @@ class Avatar:
             remaining_thread = threading.Thread(target=process_remaining, daemon=True)
             remaining_thread.start()
 
-            print(f"Inference processing complete (first chunk). Total time so far: {time.time()-start_time:.2f}s")
+            print(f"Inference processing complete (first chunk). Total time so far: {time.time() - start_time:.2f}s")
             torch.cuda.empty_cache()
             return os.path.join(base_dir, "manifest.mpd")
-
+            
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
+    """
+    Returns an instance of Avatar based on the provided avatar_id.
+    If the avatar directory exists, it is reused; otherwise, it is created.
+    """
     avatar_dir = os.path.join(RESULTS_DIR, avatar_id)
     if os.path.exists(avatar_dir):
         avatar_instance = Avatar(
