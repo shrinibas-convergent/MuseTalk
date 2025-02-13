@@ -23,6 +23,8 @@ from server.model import audio_processor, vae, unet, pe, device, timesteps
 
 # Import configuration defaults
 from server.config import DEFAULT_BATCH_SIZE, RESULTS_DIR
+# Ensure RESULTS_DIR is absolute
+RESULTS_DIR = os.path.abspath(RESULTS_DIR)
 DEFAULT_CHUNK_DURATION = 2
 
 # Global semaphore to limit concurrent inference requests.
@@ -117,7 +119,6 @@ class Avatar:
         with open(self.avatar_info_path, "w") as f:
             json.dump(self.avatar_info, f)
 
-        # If video_path is a file, extract frames.
         if os.path.isfile(self.video_path):
             cap = cv2.VideoCapture(self.video_path)
             count = 0
@@ -151,14 +152,12 @@ class Avatar:
             latents = vae.get_latents_for_unet(resized_crop_frame)
             input_latent_list.append(latents)
 
-        # Create a cycle by mirroring the lists.
         self.frame_list_cycle = frame_list + frame_list[::-1]
         self.coord_list_cycle = coord_list + coord_list[::-1]
         self.input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
         self.mask_coords_list_cycle = []
         self.mask_list_cycle = []
 
-        # For simplicity, we use a grayscale version of the frame as the mask.
         for i, frame in enumerate(frame_list + frame_list[::-1]):
             cv2.imwrite(os.path.join(self.full_imgs_path, f"{i:08d}.png"), frame)
             mask = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -179,16 +178,16 @@ class Avatar:
         Process the given audio file in chunks.
         For each audio chunk (of chunk_duration seconds), run inference to generate a video chunk,
         mux that video with the corresponding audio chunk.
-        Meanwhile, update the DASH manifest by checking for the next expected segment file
-        (segment_000.mp4, segment_001.mp4, etc.). When a segment is found, update the manifest.
+        Meanwhile, update the DASH manifest by waiting for each expected segment file (segment_000.mp4, segment_001.mp4, …)
+        and re-generating the manifest as each new segment appears.
         As soon as the first chunk is processed, return the manifest URL.
         """
         with inference_semaphore:
             print("Starting chunked DASH streaming inference ...")
             start_time = time.time()
 
-            # Create base directory for this request.
-            base_dir = os.path.normpath(os.path.join(self.avatar_path, "dash_output", unique_id))
+            # Use an absolute base directory.
+            base_dir = os.path.abspath(os.path.join(RESULTS_DIR, self.avatar_id, "dash_output", unique_id))
             osmakedirs([base_dir])
             audio_chunks_dir = os.path.join(base_dir, "audio_chunks")
             video_chunks_dir = os.path.join(base_dir, "video_chunks")
@@ -214,13 +213,11 @@ class Avatar:
                 raise Exception("No audio chunks produced.")
             print(f"Created {len(audio_chunks)} audio chunks.")
 
-            # Events for synchronization.
             first_chunk_event = threading.Event()
             all_segments_event = threading.Event()
 
             def process_chunk(i, audio_chunk):
                 print(f"Processing chunk {i+1}/{len(audio_chunks)}: {audio_chunk}")
-                # Compute features for the current chunk.
                 whisper_feature = audio_processor.audio2feat(audio_chunk)
                 whisper_chunks = audio_processor.feature2chunks(whisper_feature, fps)
                 total_frames = len(whisper_chunks)
@@ -272,7 +269,6 @@ class Avatar:
                             print("Error during inference batch:", e)
                 proc_thread.join()
 
-                # Write video chunk.
                 first_frame = self.frame_list_cycle[0]
                 height, width, _ = first_frame.shape
                 video_chunk_path = os.path.join(video_chunks_dir, f"video_chunk_{i:03d}.mp4")
@@ -309,7 +305,6 @@ class Avatar:
                 writer_thread.join()
                 ffmpeg_process.wait()
 
-                # Mux the video chunk with the corresponding audio chunk.
                 segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
                 mux_cmd = [
                     "ffmpeg",
@@ -326,18 +321,17 @@ class Avatar:
                 if i == 0:
                     first_chunk_event.set()
 
-            # Incrementally update manifest by checking for the expected segment file.
             def update_manifest_by_counter():
                 dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
                 temp_filelist = os.path.join(base_dir, "temp_filelist.txt")
                 counter = 0
                 collected_segments = []
-                # Create an empty temp file.
+                # Create an empty file list.
                 with open(temp_filelist, "w") as f:
                     pass
                 while not all_segments_event.is_set():
                     expected_seg = os.path.join(segments_dir, f"segment_{counter:03d}.mp4")
-                    print(f"Waiting for segment: {expected_seg}")
+                    print(f"Waiting for expected segment: {expected_seg}")
                     while not os.path.exists(expected_seg):
                         if all_segments_event.is_set():
                             break
@@ -346,11 +340,9 @@ class Avatar:
                         break
                     print(f"Found segment: {expected_seg}")
                     collected_segments.append(expected_seg)
-                    # Write collected segments to temp file.
                     with open(temp_filelist, "w") as f:
                         for seg in collected_segments:
                             f.write(f"file '{seg}'\n")
-                    # Update DASH manifest using the concat demuxer.
                     dash_cmd = [
                         "ffmpeg",
                         "-y",
@@ -369,7 +361,6 @@ class Avatar:
                     ]
                     subprocess.run(dash_cmd)
                     counter += 1
-                # Final manifest update.
                 with open(temp_filelist, "w") as f:
                     for seg in collected_segments:
                         f.write(f"file '{seg}'\n")
@@ -392,15 +383,12 @@ class Avatar:
                 subprocess.run(dash_cmd)
                 print("Final manifest update complete.")
 
-            # Start the manifest update thread.
             manifest_thread = threading.Thread(target=update_manifest_by_counter, daemon=True)
             manifest_thread.start()
 
-            # Process the first chunk synchronously.
             process_chunk(0, audio_chunks[0])
             first_chunk_event.wait()
 
-            # Process remaining chunks in background.
             def process_remaining():
                 for i in range(1, len(audio_chunks)):
                     process_chunk(i, audio_chunks[i])
@@ -414,10 +402,6 @@ class Avatar:
             return os.path.join(base_dir, "manifest.mpd")
             
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
-    """
-    Returns an instance of Avatar based on the provided avatar_id.
-    If the avatar directory exists, it is reused; otherwise, it is created.
-    """
     avatar_dir = os.path.join(RESULTS_DIR, avatar_id)
     if os.path.exists(avatar_dir):
         avatar_instance = Avatar(
