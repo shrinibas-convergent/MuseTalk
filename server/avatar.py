@@ -23,7 +23,7 @@ from server.model import audio_processor, vae, unet, pe, device, timesteps
 
 # Import configuration defaults
 from server.config import DEFAULT_BATCH_SIZE, RESULTS_DIR
-DEFAULT_CHUNK_DURATION = 3
+DEFAULT_CHUNK_DURATION = 2
 
 # Global semaphore to limit concurrent inference requests.
 inference_semaphore = threading.Semaphore(1)
@@ -324,8 +324,7 @@ class Avatar:
             # Function to update the DASH manifest periodically.
             def update_manifest_loop():
                 dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
-                # Use an absolute glob pattern.
-                segments_pattern = os.path.join(os.path.abspath(segments_dir), "segment_*.mp4")
+                segments_pattern = os.path.join(os.path.abspath(segments_dir), "segment_[0-9][0-9][0-9].mp4")
                 dash_cmd = [
                     "ffmpeg",
                     "-y",
@@ -343,7 +342,12 @@ class Avatar:
                     dash_manifest_path
                 ]
                 while not all_segments_event.is_set():
-                    print("Updating manifest...")
+                    files = glob.glob(segments_pattern)
+                    if not files:
+                        print("No segments found, waiting...")
+                        time.sleep(2)
+                        continue
+                    print("Updating manifest with files:", files)
                     subprocess.run(dash_cmd)
                     time.sleep(2)
                 print("Final manifest update...")
