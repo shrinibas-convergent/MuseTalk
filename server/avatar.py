@@ -340,9 +340,9 @@ class Avatar:
                         "-f", "dash",
                         "-use_template", "1",
                         "-use_timeline", "1",
-                        "-mpd_flags", "dynamic",  # added flag to generate a dynamic MPD
                         "-seg_duration", str(chunk_duration),
                         "-live", "1",
+                        "-update_period", "2",
                         "-window_size", "5",
                         "-extra_window_size", "5",
                         dash_manifest_path
