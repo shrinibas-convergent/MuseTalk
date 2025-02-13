@@ -266,6 +266,15 @@ class Avatar:
 
                 proc_thread = threading.Thread(target=process_frames)
                 proc_thread.start()
+                proc_thread.join()
+
+                # Log the number of frames generated for this chunk.
+                print(f"Chunk {i} generated {local_idx} frames.")
+
+                # For the first chunk, if insufficient frames are produced, wait a bit longer.
+                if i == 0 and local_idx < 5:
+                    print("First chunk has insufficient frames; waiting extra 2 seconds.")
+                    time.sleep(2)
 
                 with torch.no_grad():
                     for _, (whisper_batch, latent_batch) in enumerate(
@@ -283,7 +292,6 @@ class Avatar:
                                 res_frame_queue.put(res_frame)
                         except Exception as e:
                             print("Error during inference batch:", e)
-                proc_thread.join()
 
                 # Write video chunk.
                 first_frame = self.frame_list_cycle[0]
@@ -322,12 +330,12 @@ class Avatar:
                 writer_thread.join()
                 ffmpeg_process.wait()
 
-                # Ensure video and audio chunks exist and are stable before muxing.
+                # Ensure video and audio files are fully written and stable.
                 wait_for_file(video_chunk_path)
                 wait_for_file(audio_chunk)
 
                 # Mux the video chunk with the corresponding audio chunk.
-                # Write to a temporary file first with forced MP4 format.
+                # Write to a temporary file first with forced MP4 output.
                 temp_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4.tmp")
                 final_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
                 mux_cmd = [
@@ -339,7 +347,7 @@ class Avatar:
                     "-c:v", "copy",
                     "-c:a", "aac",
                     "-shortest",
-                    "-f", "mp4",  # Force MP4 output format
+                    "-f", "mp4",
                     temp_segment_path
                 ]
                 subprocess.run(mux_cmd, check=True)
@@ -348,7 +356,7 @@ class Avatar:
                 if i == 0:
                     first_chunk_event.set()
 
-            # Function to update the DASH manifest periodically using concat demuxer.
+            # DASH manifest update using concat demuxer.
             def update_manifest_loop():
                 dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
                 file_list_path = os.path.join(segments_dir, "segments.txt")
