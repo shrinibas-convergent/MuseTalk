@@ -246,7 +246,7 @@ class Avatar:
                     count = 0
                     while count < total_frames:
                         try:
-                            res_frame = res_frame_queue.get(timeout=1)
+                            res_frame = res_frame_queue.get(timeout=10)
                         except queue.Empty:
                             break
                         bbox = self.coord_list_cycle[local_idx % len(self.coord_list_cycle)]
@@ -330,13 +330,9 @@ class Avatar:
                 writer_thread.join()
                 ffmpeg_process.wait()
 
-                # Ensure video and audio files are fully written and stable.
                 wait_for_file(video_chunk_path)
                 wait_for_file(audio_chunk)
 
-                # Mux the video chunk with the corresponding audio chunk.
-                # Write to a temporary file first with forced MP4 output.
-                temp_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4.tmp")
                 final_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
                 mux_cmd = [
                     "ffmpeg",
@@ -348,10 +344,9 @@ class Avatar:
                     "-c:a", "aac",
                     "-shortest",
                     "-f", "mp4",
-                    temp_segment_path
+                    final_segment_path
                 ]
                 subprocess.run(mux_cmd, check=True)
-                os.rename(temp_segment_path, final_segment_path)
                 print(f"Segment {i:03d} created.")
                 if i == 0:
                     first_chunk_event.set()
