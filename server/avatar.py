@@ -324,23 +324,14 @@ class Avatar:
             # Function to update the DASH manifest periodically.
             def update_manifest_loop():
                 dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
-                segments_pattern = os.path.join(os.path.abspath(segments_dir), "segment_[0-9][0-9][0-9].mp4")
-                dash_cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-re",
-                    "-pattern_type", "glob",
-                    "-i", segments_pattern,
-                    "-c", "copy",
-                    "-f", "dash",
-                    "-use_template", "1",
-                    "-use_timeline", "1",
-                    "-seg_duration", str(chunk_duration),
-                    "-live", "1",
-                    "-window_size", "5",
-                    "-extra_window_size", "5",
-                    dash_manifest_path
-                ]
+                # Use an explicit pattern with wildcard.
+                segments_pattern = os.path.join(os.path.abspath(segments_dir), "segment_*.mp4")
+                # Build the ffmpeg command as a string so shell expansion occurs.
+                dash_cmd = (
+                    "ffmpeg -y -re -pattern_type glob -i \"{pattern}\" -c copy -f dash "
+                    "-use_template 1 -use_timeline 1 -seg_duration {seg_dur} -live 1 "
+                    "-window_size 5 -extra_window_size 5 \"{manifest}\""
+                ).format(pattern=segments_pattern, seg_dur=chunk_duration, manifest=dash_manifest_path)
                 while not all_segments_event.is_set():
                     files = glob.glob(segments_pattern)
                     if not files:
@@ -348,10 +339,10 @@ class Avatar:
                         time.sleep(2)
                         continue
                     print("Updating manifest with files:", files)
-                    subprocess.run(dash_cmd)
+                    subprocess.run(dash_cmd, shell=True)
                     time.sleep(2)
                 print("Final manifest update...")
-                subprocess.run(dash_cmd)
+                subprocess.run(dash_cmd, shell=True)
 
             # Start the manifest update thread.
             manifest_thread = threading.Thread(target=update_manifest_loop, daemon=True)
