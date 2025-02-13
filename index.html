@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MuseTalk Realtime DASH Client</title>
+    <!-- Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- dash.js for DASH playback -->
+    <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+    <style>
+      body {
+        background-color: #f7fafc;
+      }
+      .container {
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 1rem;
+      }
+      video {
+        width: 100%;
+        background-color: #000;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1 class="text-3xl font-bold text-center mb-6">
+        MuseTalk Realtime DASH Client
+      </h1>
+      <form id="uploadForm" class="space-y-4">
+        <div>
+          <label for="avatar_id" class="block text-lg font-medium text-gray-700"
+            >Avatar ID</label
+          >
+          <input
+            type="text"
+            id="avatar_id"
+            name="avatar_id"
+            required
+            placeholder="Enter avatar ID"
+            class="mt-1 block w-full border-gray-300 rounded-md p-2"
+          />
+        </div>
+        <div>
+          <label
+            for="bbox_shift"
+            class="block text-lg font-medium text-gray-700"
+            >Bbox Shift</label
+          >
+          <input
+            type="text"
+            id="bbox_shift"
+            name="bbox_shift"
+            value="5"
+            required
+            class="mt-1 block w-full border-gray-300 rounded-md p-2"
+          />
+        </div>
+        <div>
+          <label
+            for="batch_size"
+            class="block text-lg font-medium text-gray-700"
+            >Batch Size</label
+          >
+          <input
+            type="text"
+            id="batch_size"
+            name="batch_size"
+            value="4"
+            required
+            class="mt-1 block w-full border-gray-300 rounded-md p-2"
+          />
+        </div>
+        <div>
+          <label
+            for="chunk_duration"
+            class="block text-lg font-medium text-gray-700"
+            >Chunk Duration (seconds)</label
+          >
+          <input
+            type="number"
+            step="0.1"
+            id="chunk_duration"
+            name="chunk_duration"
+            value="2"
+            required
+            class="mt-1 block w-full border-gray-300 rounded-md p-2"
+          />
+        </div>
+        <div>
+          <label
+            for="audio_file"
+            class="block text-lg font-medium text-gray-700"
+            >Audio File</label
+          >
+          <input
+            type="file"
+            id="audio_file"
+            name="audio_file"
+            accept="audio/*"
+            required
+            class="mt-1 block w-full"
+          />
+        </div>
+        <div>
+          <label for="chunk" class="block text-lg font-medium text-gray-700"
+            >Chunk Identifier (auto-generated)</label
+          >
+          <input
+            type="text"
+            id="chunk"
+            name="chunk"
+            value="0"
+            readonly
+            class="mt-1 block w-full border-gray-300 rounded-md p-2"
+          />
+        </div>
+        <button
+          type="submit"
+          class="w-full bg-blue-600 text-white font-bold py-2 rounded-md hover:bg-blue-700"
+        >
+          Start Streaming
+        </button>
+      </form>
+      <p id="status" class="mt-4 text-center text-lg text-gray-600"></p>
+      <div class="mt-8">
+        <video id="videoPlayer" controls autoplay></video>
+      </div>
+    </div>
+
+    <script>
+      // Replace with your actual server URL.
+      const baseUrl = "https://your-server-url.example.com";
+
+      document
+        .getElementById("uploadForm")
+        .addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const statusElem = document.getElementById("status");
+          statusElem.textContent = "Uploading and processing audio...";
+
+          const formData = new FormData(event.target);
+          try {
+            // Submit the form data to the /lipsync endpoint.
+            const response = await fetch(`${baseUrl}/lipsync`, {
+              method: "POST",
+              body: formData,
+            });
+            if (!response.ok) {
+              const errorText = await response.text();
+              throw new Error(
+                `Server error: ${response.status} - ${errorText}`
+              );
+            }
+            const data = await response.json();
+            console.log("Received manifest URL:", data.manifest_url);
+            statusElem.textContent = "Starting playback...";
+
+            // Construct the full manifest URL.
+            const manifestUrl = baseUrl + data.manifest_url;
+
+            // Directly initialize dash.js player with the received manifest.
+            const videoPlayer = document.getElementById("videoPlayer");
+            const player = dashjs.MediaPlayer().create();
+            player.extend("RequestModifier", function () {
+              return {
+                modifyRequestHeader: function (xhr) {
+                  xhr.setRequestHeader("ngrok-skip-browser-warning", "true");
+                  return xhr;
+                },
+              };
+            });
+            player.initialize(videoPlayer, manifestUrl, true);
+            statusElem.textContent = "Streaming started.";
+          } catch (error) {
+            console.error("Error:", error);
+            statusElem.textContent = "Error: " + error.message;
+          }
+        });
+    </script>
+  </body>
+</html>

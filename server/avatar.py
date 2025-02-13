@@ -23,7 +23,7 @@ from server.model import audio_processor, vae, unet, pe, device, timesteps
 
 # Import configuration defaults
 from server.config import DEFAULT_BATCH_SIZE, RESULTS_DIR
-DEFAULT_CHUNK_DURATION = 2
+DEFAULT_CHUNK_DURATION = 3
 
 # Global semaphore to limit concurrent inference requests.
 inference_semaphore = threading.Semaphore(1)
@@ -213,7 +213,6 @@ class Avatar:
             first_chunk_event = threading.Event()
             all_segments_event = threading.Event()
 
-            # Function to process a single audio chunk.
             def process_chunk(i, audio_chunk):
                 print(f"Processing chunk {i+1}/{len(audio_chunks)}: {audio_chunk}")
                 # Compute features for the current chunk.
@@ -255,7 +254,9 @@ class Avatar:
                         datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
                     ):
                         try:
-                            audio_feature_batch = torch.from_numpy(whisper_batch).to(device=unet.device, dtype=unet.model.dtype)
+                            audio_feature_batch = torch.from_numpy(whisper_batch).to(
+                                device=unet.device, dtype=unet.model.dtype
+                            )
                             audio_feature_batch = pe(audio_feature_batch)
                             latent_batch = latent_batch.to(dtype=unet.model.dtype)
                             pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
@@ -266,7 +267,7 @@ class Avatar:
                             print("Error during inference batch:", e)
                 proc_thread.join()
 
-                # Write the video chunk.
+                # Write video chunk.
                 first_frame = self.frame_list_cycle[0]
                 height, width, _ = first_frame.shape
                 video_chunk_path = os.path.join(video_chunks_dir, f"video_chunk_{i:03d}.mp4")
@@ -303,7 +304,7 @@ class Avatar:
                 writer_thread.join()
                 ffmpeg_process.wait()
 
-                # Mux the generated video chunk with the corresponding audio chunk.
+                # Mux the video chunk with the corresponding audio chunk.
                 segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
                 mux_cmd = [
                     "ffmpeg",
@@ -320,15 +321,17 @@ class Avatar:
                 if i == 0:
                     first_chunk_event.set()
 
-            # Function to update the DASH manifest periodically using a glob pattern.
+            # Function to update the DASH manifest periodically.
             def update_manifest_loop():
                 dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
+                # Use an absolute glob pattern.
+                segments_pattern = os.path.join(os.path.abspath(segments_dir), "segment_*.mp4")
                 dash_cmd = [
                     "ffmpeg",
                     "-y",
                     "-re",
                     "-pattern_type", "glob",
-                    "-i", os.path.join(segments_dir, "segment_*.mp4"),
+                    "-i", segments_pattern,
                     "-c", "copy",
                     "-f", "dash",
                     "-use_template", "1",
@@ -354,7 +357,7 @@ class Avatar:
             process_chunk(0, audio_chunks[0])
             first_chunk_event.wait()
 
-            # Process the remaining chunks in the background.
+            # Process remaining chunks in background.
             def process_remaining():
                 for i in range(1, len(audio_chunks)):
                     process_chunk(i, audio_chunks[i])
