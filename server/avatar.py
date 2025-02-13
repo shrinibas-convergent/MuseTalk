@@ -32,6 +32,24 @@ def osmakedirs(path_list):
     for path in path_list:
         os.makedirs(path, exist_ok=True)
 
+def wait_for_file(filepath, timeout=10):
+    """Wait until the file exists and its size remains stable."""
+    start_time = time.time()
+    while not os.path.exists(filepath):
+        if time.time() - start_time > timeout:
+            raise Exception(f"Timeout waiting for file {filepath}")
+        time.sleep(0.1)
+    initial_size = os.path.getsize(filepath)
+    time.sleep(0.5)
+    while True:
+        new_size = os.path.getsize(filepath)
+        if new_size == initial_size:
+            break
+        initial_size = new_size
+        if time.time() - start_time > timeout:
+            raise Exception(f"Timeout waiting for file {filepath} to stabilize")
+        time.sleep(0.5)
+
 class Avatar:
     def __init__(self, avatar_id, video_path, bbox_shift, batch_size, preparation):
         self.avatar_id = avatar_id
@@ -304,19 +322,28 @@ class Avatar:
                 writer_thread.join()
                 ffmpeg_process.wait()
 
+                # Ensure video and audio chunks exist and are stable before muxing.
+                wait_for_file(video_chunk_path)
+                wait_for_file(audio_chunk)
+
                 # Mux the video chunk with the corresponding audio chunk.
-                segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
+                # Write to a temporary file first with forced MP4 format.
+                temp_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4.tmp")
+                final_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
                 mux_cmd = [
                     "ffmpeg",
                     "-y",
+                    "-fflags", "+genpts",
                     "-i", video_chunk_path,
                     "-i", audio_chunk,
                     "-c:v", "copy",
                     "-c:a", "aac",
                     "-shortest",
-                    segment_path
+                    "-f", "mp4",  # Force MP4 output format
+                    temp_segment_path
                 ]
                 subprocess.run(mux_cmd, check=True)
+                os.rename(temp_segment_path, final_segment_path)
                 print(f"Segment {i:03d} created.")
                 if i == 0:
                     first_chunk_event.set()
@@ -350,14 +377,12 @@ class Avatar:
                     print("Updating manifest with {} segments...".format(len(segments)))
                     subprocess.run(dash_cmd)
                     time.sleep(2)
-                # Final manifest update after all segments are processed.
                 segments = sorted(glob.glob(os.path.join(segments_dir, "segment_*.mp4")))
                 with open(file_list_path, "w") as f:
                     for seg in segments:
                         f.write("file '{}'\n".format(os.path.abspath(seg)))
                 subprocess.run(dash_cmd)
 
-            # Start the manifest update thread.
             manifest_thread = threading.Thread(target=update_manifest_loop, daemon=True)
             manifest_thread.start()
 
