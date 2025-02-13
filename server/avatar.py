@@ -321,32 +321,39 @@ class Avatar:
                 if i == 0:
                     first_chunk_event.set()
 
-            # Function to update the DASH manifest periodically.
+            # Function to update the DASH manifest periodically using concat demuxer.
             def update_manifest_loop():
                 dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
-                # Use an absolute glob pattern.
-                segments_pattern = os.path.join(os.path.abspath(segments_dir), "segment_*.mp4")
-                dash_cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-re",
-                    "-pattern_type", "glob",
-                    "-i", segments_pattern,
-                    "-c", "copy",
-                    "-f", "dash",
-                    "-use_template", "1",
-                    "-use_timeline", "1",
-                    "-seg_duration", str(chunk_duration),
-                    "-live", "1",
-                    "-window_size", "5",
-                    "-extra_window_size", "5",
-                    dash_manifest_path
-                ]
+                file_list_path = os.path.join(segments_dir, "segments.txt")
                 while not all_segments_event.is_set():
-                    print("Updating manifest...")
+                    segments = sorted(glob.glob(os.path.join(segments_dir, "segment_*.mp4")))
+                    with open(file_list_path, "w") as f:
+                        for seg in segments:
+                            f.write("file '{}'\n".format(os.path.abspath(seg)))
+                    dash_cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", file_list_path,
+                        "-c", "copy",
+                        "-f", "dash",
+                        "-use_template", "1",
+                        "-use_timeline", "1",
+                        "-seg_duration", str(chunk_duration),
+                        "-live", "1",
+                        "-window_size", "5",
+                        "-extra_window_size", "5",
+                        dash_manifest_path
+                    ]
+                    print("Updating manifest with {} segments...".format(len(segments)))
                     subprocess.run(dash_cmd)
                     time.sleep(2)
-                print("Final manifest update...")
+                # Final manifest update after all segments are processed.
+                segments = sorted(glob.glob(os.path.join(segments_dir, "segment_*.mp4")))
+                with open(file_list_path, "w") as f:
+                    for seg in segments:
+                        f.write("file '{}'\n".format(os.path.abspath(seg)))
                 subprocess.run(dash_cmd)
 
             # Start the manifest update thread.
