@@ -178,8 +178,9 @@ class Avatar:
         """
         Process the given audio file in chunks.
         For each audio chunk (of chunk_duration seconds), run inference to generate a video chunk,
-        mux that video with the corresponding audio chunk, and update a live DASH stream.
-        As soon as the first chunk is processed, the manifest URL is returned.
+        mux that video with the corresponding audio chunk.
+        Meanwhile, update the DASH manifest by waiting for each expected segment file (segment_000.mp4, segment_001.mp4, etc.).
+        As soon as the first chunk is processed, return the manifest URL.
         """
         with inference_semaphore:
             print("Starting chunked DASH streaming inference ...")
@@ -321,31 +322,73 @@ class Avatar:
                 if i == 0:
                     first_chunk_event.set()
 
-            # Function to update the DASH manifest periodically.
-            def update_manifest_loop():
+            # New incremental manifest update using a counter.
+            def update_manifest_by_counter():
                 dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
-                # Use an explicit pattern with wildcard.
-                segments_pattern = os.path.join(os.path.abspath(segments_dir), "segment_*.mp4")
-                # Build the ffmpeg command as a string so shell expansion occurs.
-                dash_cmd = (
-                    "ffmpeg -y -re -pattern_type glob -i \"{pattern}\" -c copy -f dash "
-                    "-use_template 1 -use_timeline 1 -seg_duration {seg_dur} -live 1 "
-                    "-window_size 5 -extra_window_size 5 \"{manifest}\""
-                ).format(pattern=segments_pattern, seg_dur=chunk_duration, manifest=dash_manifest_path)
+                counter = 0
+                collected_segments = []
+                temp_list = os.path.join(base_dir, "temp_filelist.txt")
+                # Create an empty temp file.
+                with open(temp_list, "w") as f:
+                    pass
                 while not all_segments_event.is_set():
-                    files = glob.glob(segments_pattern)
-                    if not files:
-                        print("No segments found, waiting...")
-                        time.sleep(2)
-                        continue
-                    print("Updating manifest with files:", files)
-                    subprocess.run(dash_cmd, shell=True)
-                    time.sleep(2)
-                print("Final manifest update...")
-                subprocess.run(dash_cmd, shell=True)
+                    expected_seg = os.path.join(segments_dir, f"segment_{counter:03d}.mp4")
+                    while not os.path.exists(expected_seg):
+                        if all_segments_event.is_set():
+                            break
+                        time.sleep(1)
+                    if not os.path.exists(expected_seg):
+                        break
+                    print(f"Found expected segment: {expected_seg}")
+                    collected_segments.append(expected_seg)
+                    # Rebuild the temporary file list.
+                    with open(temp_list, "w") as f:
+                        for seg in collected_segments:
+                            f.write(f"file '{seg}'\n")
+                    # Run the ffmpeg dash command using the concat demuxer.
+                    dash_cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", temp_list,
+                        "-c", "copy",
+                        "-f", "dash",
+                        "-use_template", "1",
+                        "-use_timeline", "1",
+                        "-seg_duration", str(chunk_duration),
+                        "-live", "1",
+                        "-window_size", "5",
+                        "-extra_window_size", "5",
+                        dash_manifest_path
+                    ]
+                    subprocess.run(dash_cmd)
+                    counter += 1
+                # Final manifest update.
+                with open(temp_list, "w") as f:
+                    for seg in collected_segments:
+                        f.write(f"file '{seg}'\n")
+                dash_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", temp_list,
+                    "-c", "copy",
+                    "-f", "dash",
+                    "-use_template", "1",
+                    "-use_timeline", "1",
+                    "-seg_duration", str(chunk_duration),
+                    "-live", "1",
+                    "-window_size", "5",
+                    "-extra_window_size", "5",
+                    dash_manifest_path
+                ]
+                subprocess.run(dash_cmd)
+                print("Final manifest update complete.")
 
-            # Start the manifest update thread.
-            manifest_thread = threading.Thread(target=update_manifest_loop, daemon=True)
+            # Start the incremental manifest update thread.
+            manifest_thread = threading.Thread(target=update_manifest_by_counter, daemon=True)
             manifest_thread.start()
 
             # Process the first chunk synchronously.
