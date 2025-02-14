@@ -308,6 +308,8 @@ class Avatar:
                 # Compute features for the current chunk.
                 whisper_feature = audio_processor.audio2feat(audio_chunk)
                 whisper_chunks = audio_processor.feature2chunks(whisper_feature, fps)
+                if not whisper_chunks:
+                    raise Exception(f"No whisper chunks produced for audio chunk {i}")
                 res_frame_queue = queue.Queue()
                 raw_frame_queue = queue.Queue()
                 local_idx = 0
@@ -352,7 +354,7 @@ class Avatar:
                         combined_frame = get_image_blending(ori_frame, res_frame_resized, bbox, mask, mask_crop_box)
                         raw_frame_queue.put(combined_frame)
                         local_idx += 1
-                    raw_frame_queue.put(None)  # Signal end of frames
+                    raw_frame_queue.put(None)  # Signal end
 
                 inf_thread = threading.Thread(target=inference_worker)
                 proc_thread = threading.Thread(target=processing_worker)
@@ -423,12 +425,13 @@ class Avatar:
                 if i == 0:
                     first_chunk_event.set()
 
-            # Process the first chunk synchronously.
+            # Process first chunk synchronously and return manifest immediately.
             process_chunk(0, audio_chunks[0])
             first_chunk_event.wait()
             manifest_return = manifest_path
+            print(f"First segment processed. Manifest available at: {manifest_return}")
 
-            # Process remaining chunks in background.
+            # Process remaining chunks in a background thread.
             def process_remaining():
                 for i in range(1, len(audio_chunks)):
                     process_chunk(i, audio_chunks[i])
@@ -443,8 +446,7 @@ class Avatar:
 
             remaining_thread = threading.Thread(target=process_remaining)
             remaining_thread.start()
-            remaining_thread.join()
-            print(f"Inference processing complete. Total time: {time.time()-start_time:.2f}s")
+            # Return manifest immediately without waiting for all segments.
             torch.cuda.empty_cache()
             return manifest_return
 
