@@ -241,57 +241,61 @@ class Avatar:
                 raw_frame_queue = queue.Queue()
                 local_idx = 0
 
-                def process_frames():
+                def inference_worker():
+                    with torch.no_grad():
+                        for _, (whisper_batch, latent_batch) in enumerate(
+                            datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
+                        ):
+                            try:
+                                audio_feature_batch = torch.from_numpy(whisper_batch).to(
+                                    device=unet.device, dtype=unet.model.dtype
+                                )
+                                audio_feature_batch = pe(audio_feature_batch)
+                                latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                                pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+                                recon = vae.decode_latents(pred_latents)
+                                for res_frame in recon:
+                                    res_frame_queue.put(res_frame)
+                            except Exception as e:
+                                print("Error during inference batch:", e)
+                    # Signal that inference is done.
+                    res_frame_queue.put(None)
+
+                # Processing worker: read inferred frames, blend them, and enqueue final frames.
+                def processing_worker():
                     nonlocal local_idx
-                    count = 0
-                    while count < total_frames:
-                        try:
-                            res_frame = res_frame_queue.get(timeout=10)
-                        except queue.Empty:
+                    while True:
+                        res_frame = res_frame_queue.get()
+                        if res_frame is None:
                             break
+                        # Use the next available original frame and mask for blending.
                         bbox = self.coord_list_cycle[local_idx % len(self.coord_list_cycle)]
                         ori_frame = self.frame_list_cycle[local_idx % len(self.frame_list_cycle)].copy()
                         x1, y1, x2, y2 = bbox
                         try:
-                            res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                            res_frame_resized = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
                         except Exception as e:
                             print(f"Error resizing frame: {e}")
                             continue
                         mask = self.mask_list_cycle[local_idx % len(self.mask_list_cycle)]
                         mask_crop_box = self.mask_coords_list_cycle[local_idx % len(self.mask_coords_list_cycle)]
-                        combined_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
+                        combined_frame = get_image_blending(ori_frame, res_frame_resized, bbox, mask, mask_crop_box)
                         raw_frame_queue.put(combined_frame)
                         local_idx += 1
-                        count += 1
 
-                proc_thread = threading.Thread(target=process_frames)
+                # Launch both threads.
+                inf_thread = threading.Thread(target=inference_worker)
+                proc_thread = threading.Thread(target=processing_worker)
+                inf_thread.start()
                 proc_thread.start()
+                inf_thread.join()
                 proc_thread.join()
-
-                # Log the number of frames generated for this chunk.
                 print(f"Chunk {i} generated {local_idx} frames.")
 
-                # For the first chunk, if insufficient frames are produced, wait a bit longer.
+                # For the first chunk, wait a little if frames are very few.
                 if i == 0 and local_idx < 5:
                     print("First chunk has insufficient frames; waiting extra 2 seconds.")
                     time.sleep(2)
-
-                with torch.no_grad():
-                    for _, (whisper_batch, latent_batch) in enumerate(
-                        datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
-                    ):
-                        try:
-                            audio_feature_batch = torch.from_numpy(whisper_batch).to(
-                                device=unet.device, dtype=unet.model.dtype
-                            )
-                            audio_feature_batch = pe(audio_feature_batch)
-                            latent_batch = latent_batch.to(dtype=unet.model.dtype)
-                            pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
-                            recon = vae.decode_latents(pred_latents)
-                            for res_frame in recon:
-                                res_frame_queue.put(res_frame)
-                        except Exception as e:
-                            print("Error during inference batch:", e)
 
                 # Write video chunk.
                 first_frame = self.frame_list_cycle[0]
@@ -312,22 +316,16 @@ class Avatar:
                     video_chunk_path
                 ]
                 ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-                def write_frames():
-                    while True:
-                        try:
-                            frame = raw_frame_queue.get(timeout=1)
-                            ffmpeg_process.stdin.write(frame.tobytes())
-                        except queue.Empty:
-                            break
+                while True:
                     try:
-                        ffmpeg_process.stdin.close()
-                    except Exception as e:
-                        print("Error closing ffmpeg stdin:", e)
-
-                writer_thread = threading.Thread(target=write_frames)
-                writer_thread.start()
-                writer_thread.join()
+                        frame = raw_frame_queue.get(timeout=10)
+                        ffmpeg_process.stdin.write(frame.tobytes())
+                    except queue.Empty:
+                        break
+                try:
+                    ffmpeg_process.stdin.close()
+                except Exception as e:
+                    print("Error closing ffmpeg stdin:", e)
                 ffmpeg_process.wait()
 
                 wait_for_file(video_chunk_path)
