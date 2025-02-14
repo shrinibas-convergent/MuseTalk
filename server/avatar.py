@@ -223,6 +223,7 @@ class Avatar:
             dash_cmd = [
                 "ffmpeg",
                 "-i", live_pipe,
+                "-reset_timestamps", "1",
                 "-c:v", "libx264",
                 "-b:v", "1500k",
                 "-c:a", "aac",
@@ -232,6 +233,7 @@ class Avatar:
                 "-use_template", "1",
                 "-use_timeline", "1",
                 "-seg_duration", str(chunk_duration),
+                "-loglevel", "debug",
                 manifest_path
             ]
             dash_proc = subprocess.Popen(dash_cmd)
