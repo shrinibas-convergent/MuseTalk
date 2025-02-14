@@ -66,6 +66,8 @@ def start_dash_packager(fifo_path, manifest_path, chunk_duration):
         "-live", "1",
         "-update_period", "2",
         "-seg_duration", str(chunk_duration),
+        "-use_template", "1",
+        "-use_timeline", "1",
         manifest_path
     ]
     print("Starting persistent DASH packager with command:")
@@ -73,7 +75,7 @@ def start_dash_packager(fifo_path, manifest_path, chunk_duration):
     # Launch ffmpeg persistently.
     return subprocess.Popen(packager_cmd)
 
-def append_segment_to_fifo(segment_path, fifo_path, timeout=5):
+def append_segment_to_fifo(segment_path, fifo_path, timeout=10):
     """
     Wait for the segment to be stable, then open it and append its bytes to the FIFO.
     Convert the segment (which is in MP4) to a transport stream (TS) to allow concatenation.
@@ -84,6 +86,8 @@ def append_segment_to_fifo(segment_path, fifo_path, timeout=5):
     convert_cmd = [
         "ffmpeg",
         "-y",
+        "-fflags", "+genpts",
+        "-copyts",
         "-i", segment_path,
         "-c", "copy",
         "-bsf:v", "h264_mp4toannexb",
