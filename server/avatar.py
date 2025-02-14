@@ -50,6 +50,39 @@ def wait_for_file(filepath, timeout=10):
             raise Exception(f"Timeout waiting for file {filepath} to stabilize")
         time.sleep(0.5)
 
+# --- Persistent Manifest Updater using watchdog ---
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+class ManifestUpdateHandler(FileSystemEventHandler):
+    def __init__(self, segments_dir, dash_manifest_path, chunk_duration):
+        self.segments_dir = segments_dir
+        self.dash_manifest_path = dash_manifest_path
+        self.chunk_duration = chunk_duration
+
+    def on_any_event(self, event):
+        # Only process file creation or modification for segment files.
+        if not event.is_directory and "segment_" in event.src_path and event.src_path.endswith(".mp4"):
+            self.update_manifest()
+
+    def update_manifest(self):
+        file_list_path = os.path.join(self.segments_dir, "segments.txt")
+        segments = sorted(glob.glob(os.path.join(self.segments_dir, "segment_*.mp4")))
+        with open(file_list_path, "w") as f:
+            for seg in segments:
+                f.write("file '{}'\n".format(os.path.abspath(seg)))
+        mp4box_cmd = [
+            "MP4Box",
+            "-dash", str(int(self.chunk_duration * 1000)),  # dash duration in ms
+            "-live",
+            "-profile", "urn:mpeg:dash:profile:isoff-live:2011",
+            "-out", self.dash_manifest_path
+        ] + segments
+        print("Updating manifest with {} segments using MP4Box...".format(len(segments)))
+        subprocess.run(mp4box_cmd, check=True)
+
+# --- End of persistent updater ---
+
 class Avatar:
     def __init__(self, avatar_id, video_path, bbox_shift, batch_size, preparation):
         self.avatar_id = avatar_id
@@ -261,7 +294,6 @@ class Avatar:
                     # Signal that inference is done.
                     res_frame_queue.put(None)
 
-                # Processing worker: read inferred frames, blend them, and enqueue final frames.
                 def processing_worker():
                     nonlocal local_idx
                     while True:
@@ -283,7 +315,6 @@ class Avatar:
                         raw_frame_queue.put(combined_frame)
                         local_idx += 1
 
-                # Launch both threads.
                 inf_thread = threading.Thread(target=inference_worker)
                 proc_thread = threading.Thread(target=processing_worker)
                 inf_thread.start()
@@ -292,12 +323,10 @@ class Avatar:
                 proc_thread.join()
                 print(f"Chunk {i} generated {local_idx} frames.")
 
-                # For the first chunk, wait a little if frames are very few.
                 if i == 0 and local_idx < 5:
                     print("First chunk has insufficient frames; waiting extra 2 seconds.")
                     time.sleep(2)
 
-                # Write video chunk.
                 first_frame = self.frame_list_cycle[0]
                 height, width, _ = first_frame.shape
                 video_chunk_path = os.path.join(video_chunks_dir, f"video_chunk_{i:03d}.mp4")
@@ -349,43 +378,12 @@ class Avatar:
                 if i == 0:
                     first_chunk_event.set()
 
-            # DASH manifest update using concat demuxer.
-            def update_manifest_loop():
-                dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
-                file_list_path = os.path.join(segments_dir, "segments.txt")
-                while not all_segments_event.is_set():
-                    segments = sorted(glob.glob(os.path.join(segments_dir, "segment_*.mp4")))
-                    with open(file_list_path, "w") as f:
-                        for seg in segments:
-                            f.write("file '{}'\n".format(os.path.abspath(seg)))
-                    dash_cmd = [
-                        "ffmpeg",
-                        "-y",
-                        "-f", "concat",
-                        "-safe", "0",
-                        "-i", file_list_path,
-                        "-c", "copy",
-                        "-f", "dash",
-                        "-use_template", "1",
-                        "-use_timeline", "1",
-                        "-seg_duration", str(chunk_duration),
-                        "-live", "1",
-                        "-update_period", "2",
-                        "-window_size", "5",
-                        "-extra_window_size", "5",
-                        dash_manifest_path
-                    ]
-                    print("Updating manifest with {} segments...".format(len(segments)))
-                    subprocess.run(dash_cmd)
-                    time.sleep(2)
-                segments = sorted(glob.glob(os.path.join(segments_dir, "segment_*.mp4")))
-                with open(file_list_path, "w") as f:
-                    for seg in segments:
-                        f.write("file '{}'\n".format(os.path.abspath(seg)))
-                subprocess.run(dash_cmd)
-
-            manifest_thread = threading.Thread(target=update_manifest_loop, daemon=True)
-            manifest_thread.start()
+            # Set up a persistent manifest updater using watchdog.
+            dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
+            manifest_handler = ManifestUpdateHandler(segments_dir, dash_manifest_path, chunk_duration)
+            observer = Observer()
+            observer.schedule(manifest_handler, segments_dir, recursive=False)
+            observer.start()
 
             # Process the first chunk synchronously.
             process_chunk(0, audio_chunks[0])
@@ -400,10 +398,14 @@ class Avatar:
             remaining_thread = threading.Thread(target=process_remaining, daemon=True)
             remaining_thread.start()
 
-            print(f"Inference processing complete (first chunk). Total time so far: {time.time() - start_time:.2f}s")
+            remaining_thread.join()
+            observer.stop()
+            observer.join()
+
+            print(f"Inference processing complete (all chunks). Total time: {time.time() - start_time:.2f}s")
             torch.cuda.empty_cache()
-            return os.path.join(base_dir, "manifest.mpd")
-            
+            return dash_manifest_path
+
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
     """
     Returns an instance of Avatar based on the provided avatar_id.
