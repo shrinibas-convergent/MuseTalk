@@ -60,7 +60,6 @@ def start_dash_packager(fifo_path, manifest_path, chunk_duration):
         "ffmpeg",
         "-re",
         "-i", fifo_path,
-        "-c", "copy",
         "-reset_timestamps", "1",
         "-movflags", "faststart",
         "-f", "dash",
@@ -70,6 +69,9 @@ def start_dash_packager(fifo_path, manifest_path, chunk_duration):
         "-seg_duration", str(chunk_duration),
         "-use_template", "1",
         "-use_timeline", "1",
+        "-c:v", "libx264",
+        "-b:v", "800k",
+        "-c:a", "aac",
         manifest_path
     ]
     print("Starting persistent DASH packager with command:")
@@ -91,7 +93,10 @@ def append_segment_to_fifo(segment_path, fifo_path, timeout=10):
         "-fflags", "+genpts",
         "-copyts",
         "-i", segment_path,
-        "-c", "copy",
+        "-c:v", "libx264",
+        "-b:v", "800k",
+        "-preset", "veryfast",
+        "-c:a", "aac",
         "-bsf:v", "h264_mp4toannexb",
         "-f", "mpegts",
         ts_temp
