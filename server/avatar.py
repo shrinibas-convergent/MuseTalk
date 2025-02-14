@@ -352,6 +352,7 @@ class Avatar:
                         combined_frame = get_image_blending(ori_frame, res_frame_resized, bbox, mask, mask_crop_box)
                         raw_frame_queue.put(combined_frame)
                         local_idx += 1
+                    raw_frame_queue.put(None)  # Signal end of frames
 
                 inf_thread = threading.Thread(target=inference_worker)
                 proc_thread = threading.Thread(target=processing_worker)
@@ -384,11 +385,10 @@ class Avatar:
                 ]
                 ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
                 while True:
-                    try:
-                        frame = raw_frame_queue.get(timeout=10)
-                        ffmpeg_process.stdin.write(frame.tobytes())
-                    except queue.Empty:
+                    frame = raw_frame_queue.get()
+                    if frame is None:
                         break
+                    ffmpeg_process.stdin.write(frame.tobytes())
                 try:
                     ffmpeg_process.stdin.close()
                 except Exception as e:
@@ -405,7 +405,7 @@ class Avatar:
                     "-fflags", "+genpts",
                     "-i", video_chunk_path,
                     "-i", audio_chunk,
-                    "-c:v", "libx264",            # re-encode video for uniform metadata
+                    "-c:v", "libx264",
                     "-preset", "veryfast",
                     "-crf", "23",
                     "-b:v", "800k",
@@ -441,17 +441,14 @@ class Avatar:
                 dash_proc.wait()
                 print("Dash packager terminated gracefully.")
 
-            remaining_thread = threading.Thread(target=process_remaining, daemon=True)
+            remaining_thread = threading.Thread(target=process_remaining)
             remaining_thread.start()
-
-            print(f"Inference processing started. Manifest available at: {manifest_return}")
+            remaining_thread.join()
+            print(f"Inference processing complete. Total time: {time.time()-start_time:.2f}s")
             torch.cuda.empty_cache()
             return manifest_return
 
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
-    """
-    Returns an instance of Avatar based on the provided avatar_id.
-    """
     avatar_dir = os.path.join(RESULTS_DIR, avatar_id)
     if os.path.exists(avatar_dir):
         avatar_instance = Avatar(
