@@ -369,6 +369,7 @@ class Avatar:
                     "-i", audio_chunk,
                     "-c:v", "copy",
                     "-c:a", "aac",
+                    "-movflags", "+frag_keyframe+empty_moov",
                     "-shortest",
                     "-f", "mp4",
                     final_segment_path
