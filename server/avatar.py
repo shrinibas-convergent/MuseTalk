@@ -52,10 +52,6 @@ def wait_for_file(filepath, timeout=10):
 
 # --- Persistent DASH Packaging using FIFO ---
 def start_dash_packager(fifo_path, manifest_path, chunk_duration):
-    """
-    Launch a persistent ffmpeg process that reads from the FIFO (fifo_path) and continuously produces a live MPD.
-    """
-    # The command reads from the FIFO as a live input and outputs DASH segments and MPD.
     packager_cmd = [
         "ffmpeg",
         "-re",
@@ -76,16 +72,10 @@ def start_dash_packager(fifo_path, manifest_path, chunk_duration):
     ]
     print("Starting persistent DASH packager with command:")
     print(" ".join(packager_cmd))
-    # Launch ffmpeg persistently.
     return subprocess.Popen(packager_cmd)
 
 def append_segment_to_fifo(segment_path, fifo_path, timeout=10):
-    """
-    Wait for the segment to be stable, then open it and append its bytes to the FIFO.
-    Convert the segment (which is in MP4) to a transport stream (TS) to allow concatenation.
-    """
     wait_for_file(segment_path, timeout=timeout)
-    # Convert the segment to TS on the fly.
     ts_temp = segment_path + ".ts"
     convert_cmd = [
         "ffmpeg",
@@ -102,7 +92,6 @@ def append_segment_to_fifo(segment_path, fifo_path, timeout=10):
         ts_temp
     ]
     subprocess.run(convert_cmd, check=True)
-    # Append the TS file contents to the FIFO.
     with open(ts_temp, "rb") as ts_file, open(fifo_path, "ab") as fifo:
         shutil.copyfileobj(ts_file, fifo)
     os.remove(ts_temp)
@@ -156,7 +145,6 @@ class Avatar:
                 except Exception as e:
                     print(f"Error loading existing avatar, recreating it: {e}")
                     shutil.rmtree(self.avatar_path)
-
             print(f"Creating avatar: {self.avatar_id}")
             osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
             self.prepare_material()
@@ -194,8 +182,6 @@ class Avatar:
         print("Preparing avatar data materials ...")
         with open(self.avatar_info_path, "w") as f:
             json.dump(self.avatar_info, f)
-
-        # If video_path is a file, extract frames.
         if os.path.isfile(self.video_path):
             cap = cv2.VideoCapture(self.video_path)
             count = 0
@@ -214,7 +200,6 @@ class Avatar:
                     os.path.join(self.video_path, filename),
                     os.path.join(self.full_imgs_path, filename)
                 )
-
         input_img_list = sorted(glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')))
         print("Extracting landmarks ...")
         coord_list, frame_list = get_landmark_and_bbox(input_img_list, self.bbox_shift)
@@ -228,15 +213,11 @@ class Avatar:
             resized_crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
             latents = vae.get_latents_for_unet(resized_crop_frame)
             input_latent_list.append(latents)
-
-        # Create a cycle by mirroring the lists.
         self.frame_list_cycle = frame_list + frame_list[::-1]
         self.coord_list_cycle = coord_list + coord_list[::-1]
         self.input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
         self.mask_coords_list_cycle = []
         self.mask_list_cycle = []
-
-        # For simplicity, we use a grayscale version of the frame as the mask.
         for i, frame in enumerate(frame_list + frame_list[::-1]):
             cv2.imwrite(os.path.join(self.full_imgs_path, f"{i:08d}.png"), frame)
             mask = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -244,7 +225,6 @@ class Avatar:
             cv2.imwrite(os.path.join(self.mask_out_path, f"{i:08d}.png"), mask)
             self.mask_coords_list_cycle.append(crop_box)
             self.mask_list_cycle.append(mask)
-
         with open(self.mask_coords_path, 'wb') as f:
             pickle.dump(self.mask_coords_list_cycle, f)
         with open(self.coords_path, 'wb') as f:
@@ -263,28 +243,20 @@ class Avatar:
         with inference_semaphore:
             print("Starting chunked DASH streaming inference ...")
             start_time = time.time()
-
-            # Create base directory for this request.
             base_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
             osmakedirs([base_dir])
             audio_chunks_dir = os.path.join(base_dir, "audio_chunks")
             video_chunks_dir = os.path.join(base_dir, "video_chunks")
             segments_dir = os.path.join(base_dir, "segments")
             osmakedirs([audio_chunks_dir, video_chunks_dir, segments_dir])
-
-            # Create FIFO for persistent dash packaging.
             fifo_path = os.path.join(base_dir, "fifo.ts")
             if os.path.exists(fifo_path):
                 os.remove(fifo_path)
             os.mkfifo(fifo_path)
             print(f"Created FIFO at {fifo_path}")
-
-            # Start persistent dash muxer process using ffmpeg.
             manifest_path = os.path.join(base_dir, "manifest.mpd")
             dash_proc = start_dash_packager(fifo_path, manifest_path, chunk_duration)
-            # Now, segments will be fed into the FIFO.
-
-            # Split the input audio into chunks.
+            
             split_cmd = [
                 "ffmpeg",
                 "-y",
@@ -299,40 +271,39 @@ class Avatar:
             if not audio_chunks:
                 raise Exception("No audio chunks produced.")
             print(f"Created {len(audio_chunks)} audio chunks.")
-
-            # Events for synchronization.
             first_chunk_event = threading.Event()
 
             def process_chunk(i, audio_chunk):
                 print(f"Processing chunk {i+1}/{len(audio_chunks)}: {audio_chunk}")
-                # Compute features for the current chunk.
                 whisper_feature = audio_processor.audio2feat(audio_chunk)
-                whisper_chunks = audio_processor.feature2chunks(whisper_feature, fps)
+                whisper_chunks = list(audio_processor.feature2chunks(whisper_feature, fps))
                 if not whisper_chunks:
                     raise Exception(f"No whisper chunks produced for audio chunk {i}")
+                print(f"Chunk {i}: obtained {len(whisper_chunks)} whisper chunks.")
                 res_frame_queue = queue.Queue()
                 raw_frame_queue = queue.Queue()
                 local_idx = 0
 
                 def inference_worker():
-                    with torch.no_grad():
-                        for _, (whisper_batch, latent_batch) in enumerate(
-                            datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
-                        ):
-                            try:
-                                audio_feature_batch = torch.from_numpy(whisper_batch).to(
-                                    device=unet.device, dtype=unet.model.dtype
-                                )
-                                audio_feature_batch = pe(audio_feature_batch)
-                                latent_batch = latent_batch.to(dtype=unet.model.dtype)
-                                pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
-                                recon = vae.decode_latents(pred_latents)
-                                for res_frame in recon:
-                                    res_frame_queue.put(res_frame)
-                            except Exception as e:
-                                print("Error during inference batch:", e)
-                    # Signal that inference is done.
-                    res_frame_queue.put(None)
+                    try:
+                        with torch.no_grad():
+                            for _, (whisper_batch, latent_batch) in enumerate(
+                                datagen(whisper_chunks, self.input_latent_list_cycle, self.batch_size)
+                            ):
+                                try:
+                                    audio_feature_batch = torch.from_numpy(whisper_batch).to(
+                                        device=unet.device, dtype=unet.model.dtype
+                                    )
+                                    audio_feature_batch = pe(audio_feature_batch)
+                                    latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                                    pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+                                    recon = vae.decode_latents(pred_latents)
+                                    for res_frame in recon:
+                                        res_frame_queue.put(res_frame)
+                                except Exception as e:
+                                    print(f"Error during inference batch in chunk {i}:", e)
+                    finally:
+                        res_frame_queue.put(None)
 
                 def processing_worker():
                     nonlocal local_idx
@@ -340,21 +311,20 @@ class Avatar:
                         res_frame = res_frame_queue.get()
                         if res_frame is None:
                             break
-                        # Use the next available original frame and mask for blending.
                         bbox = self.coord_list_cycle[local_idx % len(self.coord_list_cycle)]
                         ori_frame = self.frame_list_cycle[local_idx % len(self.frame_list_cycle)].copy()
                         x1, y1, x2, y2 = bbox
                         try:
                             res_frame_resized = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
                         except Exception as e:
-                            print(f"Error resizing frame: {e}")
+                            print(f"Error resizing frame in chunk {i}: {e}")
                             continue
                         mask = self.mask_list_cycle[local_idx % len(self.mask_list_cycle)]
                         mask_crop_box = self.mask_coords_list_cycle[local_idx % len(self.mask_coords_list_cycle)]
                         combined_frame = get_image_blending(ori_frame, res_frame_resized, bbox, mask, mask_crop_box)
                         raw_frame_queue.put(combined_frame)
                         local_idx += 1
-                    raw_frame_queue.put(None)  # Signal end
+                    raw_frame_queue.put(None)
 
                 inf_thread = threading.Thread(target=inference_worker)
                 proc_thread = threading.Thread(target=processing_worker)
@@ -363,11 +333,8 @@ class Avatar:
                 inf_thread.join()
                 proc_thread.join()
                 print(f"Chunk {i} generated {local_idx} frames.")
-
                 if i == 0 and local_idx < 5:
-                    print("First chunk has insufficient frames; waiting extra 2 seconds.")
-                    time.sleep(2)
-
+                    print("First chunk produced very few frames; waiting until processing completes.")
                 first_frame = self.frame_list_cycle[0]
                 height, width, _ = first_frame.shape
                 video_chunk_path = os.path.join(video_chunks_dir, f"video_chunk_{i:03d}.mp4")
@@ -394,12 +361,10 @@ class Avatar:
                 try:
                     ffmpeg_process.stdin.close()
                 except Exception as e:
-                    print("Error closing ffmpeg stdin:", e)
+                    print(f"Error closing ffmpeg stdin in chunk {i}:", e)
                 ffmpeg_process.wait()
-
                 wait_for_file(video_chunk_path)
                 wait_for_file(audio_chunk)
-
                 final_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
                 mux_cmd = [
                     "ffmpeg",
@@ -420,7 +385,6 @@ class Avatar:
                 ]
                 subprocess.run(mux_cmd, check=True)
                 print(f"Segment {i:03d} created.")
-                # Append the segment to the FIFO (convert to TS on the fly)
                 append_segment_to_fifo(final_segment_path, fifo_path)
                 if i == 0:
                     first_chunk_event.set()
@@ -436,17 +400,14 @@ class Avatar:
                 for i in range(1, len(audio_chunks)):
                     process_chunk(i, audio_chunks[i])
                 print("All chunks processed.")
-                # Signal EOF to FIFO.
                 with open(fifo_path, "wb") as fifo:
                     pass
-                time.sleep(2)
                 dash_proc.terminate()
                 dash_proc.wait()
                 print("Dash packager terminated gracefully.")
 
             remaining_thread = threading.Thread(target=process_remaining)
             remaining_thread.start()
-            # Return manifest immediately without waiting for all segments.
             torch.cuda.empty_cache()
             return manifest_return
 
