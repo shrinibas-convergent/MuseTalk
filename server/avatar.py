@@ -352,7 +352,8 @@ class Avatar:
                     "-framerate", str(fps),
                     "-i", "pipe:0",
                     "-c:v", "libx264",
-                    "-g", str(fps),
+                    "-g", str(int(fps/2)),
+                    "-force_key_frames", "expr:gte(t,0)",
                     "-pix_fmt", "yuv420p",
                     "-preset", "veryfast",
                     "-crf", "23",
@@ -397,7 +398,7 @@ class Avatar:
             first_segment_event.wait()
 
             # Additional wait: ensure the manifest file is properly created.
-            timeout_manifest = time.time() + 10  # wait up to 10 seconds
+            timeout_manifest = time.time() + 100  # wait up to 100 seconds
             while time.time() < timeout_manifest:
                 try:
                     tree = ET.parse(manifest_path)
