@@ -358,6 +358,7 @@ class Avatar:
                     "-g", str(fps),
                     "-force_key_frames", "expr:gte(t,0)",
                     "-sc_threshold", "0",
+                    "-reset_timestamps", "1",
                     "-pix_fmt", "yuv420p",
                     "-preset", "veryfast",
                     "-crf", "23",
