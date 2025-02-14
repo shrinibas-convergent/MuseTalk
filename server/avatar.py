@@ -232,9 +232,6 @@ class Avatar:
                 "-use_template", "1",
                 "-use_timeline", "1",
                 "-seg_duration", str(chunk_duration),
-                "-min_buffer_time", str(chunk_duration),
-                "-window_size", "5",
-                "-extra_window_size", "5",
                 manifest_path
             ]
             dash_proc = subprocess.Popen(dash_cmd)
