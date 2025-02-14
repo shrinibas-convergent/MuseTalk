@@ -302,14 +302,12 @@ class Avatar:
 
             # Events for synchronization.
             first_chunk_event = threading.Event()
-            all_segments_event = threading.Event()
 
             def process_chunk(i, audio_chunk):
                 print(f"Processing chunk {i+1}/{len(audio_chunks)}: {audio_chunk}")
                 # Compute features for the current chunk.
                 whisper_feature = audio_processor.audio2feat(audio_chunk)
                 whisper_chunks = audio_processor.feature2chunks(whisper_feature, fps)
-                total_frames = len(whisper_chunks)
                 res_frame_queue = queue.Queue()
                 raw_frame_queue = queue.Queue()
                 local_idx = 0
@@ -425,39 +423,34 @@ class Avatar:
                 if i == 0:
                     first_chunk_event.set()
 
-            # Process audio chunks sequentially.
-            audio_chunks = sorted(glob.glob(os.path.join(audio_chunks_dir, "chunk_*.wav")))
-            if not audio_chunks:
-                raise Exception("No audio chunks produced.")
-            print(f"Total {len(audio_chunks)} audio chunks created.")
-
             # Process the first chunk synchronously.
             process_chunk(0, audio_chunks[0])
             first_chunk_event.wait()
+            manifest_return = manifest_path
 
             # Process remaining chunks in background.
             def process_remaining():
                 for i in range(1, len(audio_chunks)):
                     process_chunk(i, audio_chunks[i])
                 print("All chunks processed.")
-                all_segments_event.set()
+                # Signal EOF to FIFO.
+                with open(fifo_path, "wb") as fifo:
+                    pass
+                time.sleep(2)
+                dash_proc.terminate()
+                dash_proc.wait()
+                print("Dash packager terminated gracefully.")
+
             remaining_thread = threading.Thread(target=process_remaining, daemon=True)
             remaining_thread.start()
 
-            remaining_thread.join()
-            # After processing all chunks, we close the FIFO by opening it in write mode and closing immediately.
-            with open(fifo_path, "wb") as fifo:
-                pass
-            # Wait for persistent dash packager to finish.
-            dash_proc.wait()
-            print(f"Inference processing complete (all chunks). Total time: {time.time() - start_time:.2f}s")
+            print(f"Inference processing started. Manifest available at: {manifest_return}")
             torch.cuda.empty_cache()
-            return manifest_path
+            return manifest_return
 
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
     """
     Returns an instance of Avatar based on the provided avatar_id.
-    If the avatar directory exists, it is reused; otherwise, it is created.
     """
     avatar_dir = os.path.join(RESULTS_DIR, avatar_id)
     if os.path.exists(avatar_dir):
