@@ -276,6 +276,7 @@ class Avatar:
             def process_chunk(i, audio_chunk):
                 print(f"Processing chunk {i+1}/{len(audio_chunks)}: {audio_chunk}")
                 whisper_feature = audio_processor.audio2feat(audio_chunk)
+                # Convert to list to ensure proper iteration
                 whisper_chunks = list(audio_processor.feature2chunks(whisper_feature, fps))
                 if not whisper_chunks:
                     raise Exception(f"No whisper chunks produced for audio chunk {i}")
@@ -324,6 +325,7 @@ class Avatar:
                         combined_frame = get_image_blending(ori_frame, res_frame_resized, bbox, mask, mask_crop_box)
                         raw_frame_queue.put(combined_frame)
                         local_idx += 1
+                    # Signal that no more frames will be sent.
                     raw_frame_queue.put(None)
 
                 inf_thread = threading.Thread(target=inference_worker)
@@ -335,6 +337,7 @@ class Avatar:
                 print(f"Chunk {i} generated {local_idx} frames.")
                 if i == 0 and local_idx < 5:
                     print("First chunk produced very few frames; waiting until processing completes.")
+                    time.sleep(2)
                 first_frame = self.frame_list_cycle[0]
                 height, width, _ = first_frame.shape
                 video_chunk_path = os.path.join(video_chunks_dir, f"video_chunk_{i:03d}.mp4")
@@ -366,6 +369,7 @@ class Avatar:
                 wait_for_file(video_chunk_path)
                 wait_for_file(audio_chunk)
                 final_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
+                # Revert mux command parameters to the older working version.
                 mux_cmd = [
                     "ffmpeg",
                     "-y",
@@ -373,8 +377,6 @@ class Avatar:
                     "-i", video_chunk_path,
                     "-i", audio_chunk,
                     "-c:v", "libx264",
-                    "-preset", "veryfast",
-                    "-crf", "23",
                     "-b:v", "800k",
                     "-c:a", "aac",
                     "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
