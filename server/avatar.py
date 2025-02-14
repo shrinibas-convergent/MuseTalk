@@ -90,8 +90,6 @@ def append_segment_to_fifo(segment_path, fifo_path, timeout=10):
         "-y",
         "-fflags", "+genpts",
         "-copyts",
-        "-muxdelay", "0",
-        "-muxpreload", "0",
         "-i", segment_path,
         "-c", "copy",
         "-bsf:v", "h264_mp4toannexb",
