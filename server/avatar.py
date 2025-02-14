@@ -369,7 +369,7 @@ class Avatar:
                     "-i", audio_chunk,
                     "-c:v", "copy",
                     "-c:a", "aac",
-                    "-movflags", "+frag_keyframe+empty_moov",
+                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                     "-shortest",
                     "-f", "mp4",
                     final_segment_path
