@@ -352,6 +352,7 @@ class Avatar:
                     "-framerate", str(fps),
                     "-i", "pipe:0",
                     "-c:v", "libx264",
+                    "-g", str(fps),
                     "-pix_fmt", "yuv420p",
                     "-preset", "veryfast",
                     "-crf", "23",
@@ -402,8 +403,19 @@ class Avatar:
                     tree = ET.parse(manifest_path)
                     root = tree.getroot()
                     ns = {"dash": "urn:mpeg:dash:schema:mpd:2011"}
-                    timeline = root.find(".//dash:SegmentTimeline", ns)
-                    if timeline is not None and timeline.find("dash:S", ns) is not None:
+                    video_ready = False
+                    audio_ready = False
+                    for adapt in root.findall(".//dash:AdaptationSet", ns):
+                        contentType = adapt.get("contentType")
+                        seg_template = adapt.find(".//dash:SegmentTemplate", ns)
+                        if seg_template is not None:
+                            timeline = seg_template.find("dash:SegmentTimeline", ns)
+                            if timeline is not None and len(timeline.findall("dash:S", ns)) > 0:
+                                if contentType == "video":
+                                    video_ready = True
+                                elif contentType == "audio":
+                                    audio_ready = True
+                    if video_ready and audio_ready:
                         break
                 except Exception as e:
                     pass
