@@ -50,38 +50,53 @@ def wait_for_file(filepath, timeout=10):
             raise Exception(f"Timeout waiting for file {filepath} to stabilize")
         time.sleep(0.5)
 
-# --- Persistent Manifest Updater using watchdog ---
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+# --- Persistent DASH Packaging using FIFO ---
+def start_dash_packager(fifo_path, manifest_path, chunk_duration):
+    """
+    Launch a persistent ffmpeg process that reads from the FIFO (fifo_path) and continuously produces a live MPD.
+    """
+    # The command reads from the FIFO as a live input and outputs DASH segments and MPD.
+    packager_cmd = [
+        "ffmpeg",
+        "-re",
+        "-i", fifo_path,
+        "-c", "copy",
+        "-f", "dash",
+        "-window_size", "5",
+        "-live", "1",
+        "-update_period", "2",
+        "-seg_duration", str(chunk_duration),
+        manifest_path
+    ]
+    print("Starting persistent DASH packager with command:")
+    print(" ".join(packager_cmd))
+    # Launch ffmpeg persistently.
+    return subprocess.Popen(packager_cmd)
 
-class ManifestUpdateHandler(FileSystemEventHandler):
-    def __init__(self, segments_dir, dash_manifest_path, chunk_duration):
-        self.segments_dir = segments_dir
-        self.dash_manifest_path = dash_manifest_path
-        self.chunk_duration = chunk_duration
+def append_segment_to_fifo(segment_path, fifo_path, timeout=5):
+    """
+    Wait for the segment to be stable, then open it and append its bytes to the FIFO.
+    Convert the segment (which is in MP4) to a transport stream (TS) to allow concatenation.
+    """
+    wait_for_file(segment_path, timeout=timeout)
+    # Convert the segment to TS on the fly.
+    ts_temp = segment_path + ".ts"
+    convert_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", segment_path,
+        "-c", "copy",
+        "-f", "mpegts",
+        ts_temp
+    ]
+    subprocess.run(convert_cmd, check=True)
+    # Append the TS file contents to the FIFO.
+    with open(ts_temp, "rb") as ts_file, open(fifo_path, "ab") as fifo:
+        shutil.copyfileobj(ts_file, fifo)
+    os.remove(ts_temp)
+    print(f"Appended segment {os.path.basename(segment_path)} to FIFO.")
 
-    def on_any_event(self, event):
-        # Only process file creation or modification for segment files.
-        if not event.is_directory and "segment_" in event.src_path and event.src_path.endswith(".mp4"):
-            self.update_manifest()
-
-    def update_manifest(self):
-        file_list_path = os.path.join(self.segments_dir, "segments.txt")
-        segments = sorted(glob.glob(os.path.join(self.segments_dir, "segment_*.mp4")))
-        with open(file_list_path, "w") as f:
-            for seg in segments:
-                f.write("file '{}'\n".format(os.path.abspath(seg)))
-        mp4box_cmd = [
-            "MP4Box",
-            "-dash", str(int(self.chunk_duration * 1000)),  # dash duration in ms
-            "-live",
-            "-profile", "urn:mpeg:dash:profile:isoff-live:2011",
-            "-out", self.dash_manifest_path
-        ] + segments
-        print("Updating manifest with {} segments using MP4Box...".format(len(segments)))
-        subprocess.run(mp4box_cmd, check=True)
-
-# --- End of persistent updater ---
+# --- End of Persistent Packaging using FIFO ---
 
 class Avatar:
     def __init__(self, avatar_id, video_path, bbox_shift, batch_size, preparation):
@@ -229,8 +244,9 @@ class Avatar:
         """
         Process the given audio file in chunks.
         For each audio chunk (of chunk_duration seconds), run inference to generate a video chunk,
-        mux that video with the corresponding audio chunk, and update a live DASH stream.
-        As soon as the first chunk is processed, the manifest URL is returned.
+        mux that video with the corresponding audio chunk, and feed the segment into a persistent
+        ffmpeg dash muxer running on a FIFO.
+        Returns the manifest path once the first chunk is processed.
         """
         with inference_semaphore:
             print("Starting chunked DASH streaming inference ...")
@@ -243,6 +259,32 @@ class Avatar:
             video_chunks_dir = os.path.join(base_dir, "video_chunks")
             segments_dir = os.path.join(base_dir, "segments")
             osmakedirs([audio_chunks_dir, video_chunks_dir, segments_dir])
+
+            # Create FIFO for persistent dash packaging.
+            fifo_path = os.path.join(base_dir, "fifo.ts")
+            if os.path.exists(fifo_path):
+                os.remove(fifo_path)
+            os.mkfifo(fifo_path)
+            print(f"Created FIFO at {fifo_path}")
+
+            # Start persistent dash muxer process using ffmpeg.
+            manifest_path = os.path.join(base_dir, "manifest.mpd")
+            dash_cmd = [
+                "ffmpeg",
+                "-re",
+                "-i", fifo_path,
+                "-c", "copy",
+                "-f", "dash",
+                "-window_size", "5",
+                "-live", "1",
+                "-update_period", "2",
+                "-seg_duration", str(chunk_duration),
+                manifest_path
+            ]
+            print("Starting persistent dash muxer with command:")
+            print(" ".join(dash_cmd))
+            dash_proc = subprocess.Popen(dash_cmd)
+            # We'll feed segments into the FIFO as they are produced.
 
             # Split the input audio into chunks.
             split_cmd = [
@@ -377,15 +419,16 @@ class Avatar:
                 ]
                 subprocess.run(mux_cmd, check=True)
                 print(f"Segment {i:03d} created.")
+                # Append the segment to the FIFO (convert to TS on the fly)
+                append_segment_to_fifo(final_segment_path, fifo_path)
                 if i == 0:
                     first_chunk_event.set()
 
-            # Set up a persistent manifest updater using watchdog.
-            dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
-            manifest_handler = ManifestUpdateHandler(segments_dir, dash_manifest_path, chunk_duration)
-            observer = Observer()
-            observer.schedule(manifest_handler, segments_dir, recursive=False)
-            observer.start()
+            # Process audio chunks sequentially.
+            audio_chunks = sorted(glob.glob(os.path.join(audio_chunks_dir, "chunk_*.wav")))
+            if not audio_chunks:
+                raise Exception("No audio chunks produced.")
+            print(f"Total {len(audio_chunks)} audio chunks created.")
 
             # Process the first chunk synchronously.
             process_chunk(0, audio_chunks[0])
@@ -401,12 +444,14 @@ class Avatar:
             remaining_thread.start()
 
             remaining_thread.join()
-            observer.stop()
-            observer.join()
-
+            # After processing all chunks, we close the FIFO by opening it in write mode and closing immediately.
+            with open(fifo_path, "wb") as fifo:
+                pass
+            # Wait for persistent dash packager to finish.
+            dash_proc.wait()
             print(f"Inference processing complete (all chunks). Total time: {time.time() - start_time:.2f}s")
             torch.cuda.empty_cache()
-            return dash_manifest_path
+            return manifest_path
 
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
     """
