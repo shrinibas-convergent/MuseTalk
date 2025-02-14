@@ -397,8 +397,18 @@ class Avatar:
             process_chunk(0, audio_chunks[0])
             first_segment_event.wait()
 
-            # Additional wait: ensure the manifest file is properly created.
-            timeout_manifest = time.time() + 100  # wait up to 100 seconds
+
+            # Process remaining chunks in a background thread.
+            def process_remaining():
+                for i in range(1, len(audio_chunks)):
+                    process_chunk(i, audio_chunks[i])
+                print("All chunks processed.")
+                # Signal the pipe writer thread to finish.
+                segment_queue.put(None)
+            remaining_thread = threading.Thread(target=process_remaining, daemon=True)
+            remaining_thread.start()
+            
+            timeout_manifest = time.time() + 30  # wait up to 100 seconds
             while time.time() < timeout_manifest:
                 try:
                     tree = ET.parse(manifest_path)
@@ -421,17 +431,6 @@ class Avatar:
                 except Exception as e:
                     pass
                 time.sleep(0.1)
-
-            # Process remaining chunks in a background thread.
-            def process_remaining():
-                for i in range(1, len(audio_chunks)):
-                    process_chunk(i, audio_chunks[i])
-                print("All chunks processed.")
-                # Signal the pipe writer thread to finish.
-                segment_queue.put(None)
-            remaining_thread = threading.Thread(target=process_remaining, daemon=True)
-            remaining_thread.start()
-
             print(f"Inference processing complete (first chunk). Total time so far: {time.time() - start_time:.2f}s")
             torch.cuda.empty_cache()
             return manifest_path
