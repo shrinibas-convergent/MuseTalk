@@ -370,6 +370,7 @@ class Avatar:
                     "-c:v", "copy",
                     "-c:a", "aac",
                     "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                    "-reset_timestamps", "1",
                     "-shortest",
                     "-f", "mp4",
                     final_segment_path
