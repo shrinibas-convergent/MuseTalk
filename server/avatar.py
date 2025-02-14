@@ -194,13 +194,14 @@ class Avatar:
 
     def inference_dash(self, audio_path, fps, unique_id, chunk_duration=DEFAULT_CHUNK_DURATION):
         """
-        Process the given audio file in chunks.
-        For each audio chunk (of chunk_duration seconds), run inference to generate a video chunk,
-        mux that video with the corresponding audio chunk, and update a live DASH stream.
-        As soon as the first chunk is processed, the manifest URL is returned.
+        Process the given audio file in chunks and stream a live DASH output.
+        Instead of updating a static manifest, a persistent ffmpeg process is launched
+        that reads from a named pipe. As each segment is generated (muxed into a TS segment),
+        it is enqueued to a writer thread that continuously pipes the segment data into ffmpeg.
+        This enables a live stream that buffers and waits for new segments if delays occur.
         """
         with inference_semaphore:
-            print("Starting chunked DASH streaming inference ...")
+            print("Starting chunked live DASH streaming inference ...")
             start_time = time.time()
 
             # Create base directory for this request.
@@ -210,6 +211,32 @@ class Avatar:
             video_chunks_dir = os.path.join(base_dir, "video_chunks")
             segments_dir = os.path.join(base_dir, "segments")
             osmakedirs([audio_chunks_dir, video_chunks_dir, segments_dir])
+
+            # Create a named pipe for the live stream input.
+            live_pipe = os.path.join(base_dir, "live_pipe.ts")
+            if not os.path.exists(live_pipe):
+                os.mkfifo(live_pipe)
+            manifest_path = os.path.join(base_dir, "manifest.mpd")
+
+            # Start a persistent ffmpeg process that reads from the named pipe and outputs DASH.
+            dash_cmd = [
+                "ffmpeg",
+                "-re",
+                "-i", live_pipe,
+                "-c:v", "libx264",
+                "-b:v", "1500k",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-f", "dash",
+                "-use_template", "1",
+                "-use_timeline", "1",
+                "-seg_duration", str(chunk_duration),
+                "-window_size", "5",
+                "-extra_window_size", "5",
+                manifest_path
+            ]
+            dash_proc = subprocess.Popen(dash_cmd)
+            print("Persistent DASH ffmpeg process started.")
 
             # Split the input audio into chunks.
             split_cmd = [
@@ -227,10 +254,25 @@ class Avatar:
                 raise Exception("No audio chunks produced.")
             print(f"Created {len(audio_chunks)} audio chunks.")
 
-            # Events for synchronization.
-            first_chunk_event = threading.Event()
-            all_segments_event = threading.Event()
+            # Create a thread-safe queue for TS segments.
+            segment_queue = queue.Queue()
 
+            # This thread opens the named pipe once and writes segments continuously.
+            def pipe_writer():
+                with open(live_pipe, "wb") as pipe:
+                    while True:
+                        seg_path = segment_queue.get()
+                        if seg_path is None:  # Sentinel value to end the thread.
+                            break
+                        with open(seg_path, "rb") as seg_file:
+                            shutil.copyfileobj(seg_file, pipe)
+                        segment_queue.task_done()
+                print("Pipe writer thread finished.")
+
+            pipe_writer_thread = threading.Thread(target=pipe_writer, daemon=True)
+            pipe_writer_thread.start()
+
+            # Process each audio chunk and generate video segments.
             def process_chunk(i, audio_chunk):
                 print(f"Processing chunk {i+1}/{len(audio_chunks)}: {audio_chunk}")
                 # Compute features for the current chunk.
@@ -258,7 +300,6 @@ class Avatar:
                                     res_frame_queue.put(res_frame)
                             except Exception as e:
                                 print("Error during inference batch:", e)
-                    # Signal that inference is done.
                     res_frame_queue.put(None)
 
                 # Processing worker: read inferred frames, blend them, and enqueue final frames.
@@ -283,7 +324,7 @@ class Avatar:
                         raw_frame_queue.put(combined_frame)
                         local_idx += 1
 
-                # Launch both threads.
+                # Launch both threads for inference and processing.
                 inf_thread = threading.Thread(target=inference_worker)
                 proc_thread = threading.Thread(target=processing_worker)
                 inf_thread.start()
@@ -292,7 +333,6 @@ class Avatar:
                 proc_thread.join()
                 print(f"Chunk {i} generated {local_idx} frames.")
 
-                # For the first chunk, wait a little if frames are very few.
                 if i == 0 and local_idx < 5:
                     print("First chunk has insufficient frames; waiting extra 2 seconds.")
                     time.sleep(2)
@@ -331,7 +371,8 @@ class Avatar:
                 wait_for_file(video_chunk_path)
                 wait_for_file(audio_chunk)
 
-                final_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.mp4")
+                # Mux video and audio into a TS segment.
+                final_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.ts")
                 mux_cmd = [
                     "ffmpeg",
                     "-y",
@@ -341,69 +382,31 @@ class Avatar:
                     "-c:v", "copy",
                     "-c:a", "aac",
                     "-shortest",
-                    "-f", "mp4",
+                    "-f", "mpegts",
                     final_segment_path
                 ]
                 subprocess.run(mux_cmd, check=True)
                 print(f"Segment {i:03d} created.")
-                if i == 0:
-                    first_chunk_event.set()
-
-            # DASH manifest update using concat demuxer.
-            def update_manifest_loop():
-                dash_manifest_path = os.path.join(base_dir, "manifest.mpd")
-                file_list_path = os.path.join(segments_dir, "segments.txt")
-                while not all_segments_event.is_set():
-                    segments = sorted(glob.glob(os.path.join(segments_dir, "segment_*.mp4")))
-                    with open(file_list_path, "w") as f:
-                        for seg in segments:
-                            f.write("file '{}'\n".format(os.path.abspath(seg)))
-                    dash_cmd = [
-                        "ffmpeg",
-                        "-y",
-                        "-f", "concat",
-                        "-safe", "0",
-                        "-i", file_list_path,
-                        "-c", "copy",
-                        "-f", "dash",
-                        "-use_template", "1",
-                        "-use_timeline", "1",
-                        "-seg_duration", str(chunk_duration),
-                        "-live", "1",
-                        "-update_period", "2",
-                        "-window_size", "5",
-                        "-extra_window_size", "5",
-                        dash_manifest_path
-                    ]
-                    print("Updating manifest with {} segments...".format(len(segments)))
-                    subprocess.run(dash_cmd)
-                    time.sleep(2)
-                segments = sorted(glob.glob(os.path.join(segments_dir, "segment_*.mp4")))
-                with open(file_list_path, "w") as f:
-                    for seg in segments:
-                        f.write("file '{}'\n".format(os.path.abspath(seg)))
-                subprocess.run(dash_cmd)
-
-            manifest_thread = threading.Thread(target=update_manifest_loop, daemon=True)
-            manifest_thread.start()
+                # Enqueue the segment for live streaming.
+                segment_queue.put(final_segment_path)
 
             # Process the first chunk synchronously.
             process_chunk(0, audio_chunks[0])
-            first_chunk_event.wait()
 
             # Process remaining chunks in background.
             def process_remaining():
                 for i in range(1, len(audio_chunks)):
                     process_chunk(i, audio_chunks[i])
                 print("All chunks processed.")
-                all_segments_event.set()
+                # Signal the pipe writer thread to finish.
+                segment_queue.put(None)
             remaining_thread = threading.Thread(target=process_remaining, daemon=True)
             remaining_thread.start()
 
             print(f"Inference processing complete (first chunk). Total time so far: {time.time() - start_time:.2f}s")
             torch.cuda.empty_cache()
-            return os.path.join(base_dir, "manifest.mpd")
-            
+            return manifest_path
+
 def get_or_create_avatar(avatar_id, video_path, bbox_shift, batch_size=DEFAULT_BATCH_SIZE, preparation=True):
     """
     Returns an instance of Avatar based on the provided avatar_id.

@@ -131,7 +131,25 @@
 
     <script>
       // Replace with your actual server URL.
-      const baseUrl = "https://3be9-35-185-1-162.ngrok-free.app";
+      const baseUrl = "https://9a9d-35-230-80-191.ngrok-free.app";
+
+      // Function to poll for manifest availability.
+      async function pollForManifest(manifestUrl, interval = 2000) {
+        let manifestReady = false;
+        while (!manifestReady) {
+          try {
+            const response = await fetch(manifestUrl, { method: "HEAD" });
+            if (response.ok) {
+              manifestReady = true;
+              break;
+            }
+          } catch (error) {
+            // Ignore error and try again.
+          }
+          await new Promise((resolve) => setTimeout(resolve, interval));
+        }
+        return manifestUrl;
+      }
 
       document
         .getElementById("uploadForm")
@@ -155,12 +173,16 @@
             }
             const data = await response.json();
             console.log("Received manifest URL:", data.manifest_url);
-            statusElem.textContent = "Starting playback...";
+            statusElem.textContent = "Waiting for manifest to be ready...";
 
             // Construct the full manifest URL.
             const manifestUrl = baseUrl + data.manifest_url;
 
-            // Directly initialize dash.js player with the received manifest.
+            // Poll for the manifest until it's available.
+            await pollForManifest(manifestUrl);
+
+            statusElem.textContent = "Starting playback...";
+            // Initialize dash.js player with the manifest.
             const videoPlayer = document.getElementById("videoPlayer");
             const player = dashjs.MediaPlayer().create();
             player.extend("RequestModifier", function () {
