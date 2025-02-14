@@ -12,6 +12,7 @@ import subprocess
 import numpy as np
 from tqdm import tqdm
 import copy
+import xml.etree.ElementTree as ET
 
 # Import helper functions from the musetalk package
 from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
@@ -256,16 +257,21 @@ class Avatar:
 
             # Create a thread-safe queue for TS segments.
             segment_queue = queue.Queue()
+            first_segment_event = threading.Event()
 
             # This thread opens the named pipe once and writes segments continuously.
             def pipe_writer():
                 with open(live_pipe, "wb") as pipe:
+                    first_segment_sent = False
                     while True:
                         seg_path = segment_queue.get()
                         if seg_path is None:  # Sentinel value to end the thread.
                             break
                         with open(seg_path, "rb") as seg_file:
                             shutil.copyfileobj(seg_file, pipe)
+                        if not first_segment_sent:
+                            first_segment_event.set()
+                            first_segment_sent = True
                         segment_queue.task_done()
                 print("Pipe writer thread finished.")
 
@@ -389,6 +395,21 @@ class Avatar:
 
             # Process the first chunk synchronously.
             process_chunk(0, audio_chunks[0])
+            first_segment_event.wait()
+
+            # Additional wait: ensure the manifest file is properly created.
+            timeout_manifest = time.time() + 10  # wait up to 10 seconds
+            while time.time() < timeout_manifest:
+                try:
+                    tree = ET.parse(manifest_path)
+                    root = tree.getroot()
+                    ns = {"dash": "urn:mpeg:dash:schema:mpd:2011"}
+                    timeline = root.find(".//dash:SegmentTimeline", ns)
+                    if timeline is not None and timeline.find("dash:S", ns) is not None:
+                        break
+                except Exception as e:
+                    pass
+                time.sleep(0.1)
 
             # Process remaining chunks in a background thread.
             def process_remaining():

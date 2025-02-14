@@ -25,3 +25,4 @@ ipykernel
 tqdm
 uvicorn[standard]
 fastapi
+elementpath
