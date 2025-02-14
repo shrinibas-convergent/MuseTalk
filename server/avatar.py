@@ -222,7 +222,6 @@ class Avatar:
             # Start a persistent ffmpeg process that reads from the named pipe and outputs DASH.
             dash_cmd = [
                 "ffmpeg",
-                "-re",
                 "-i", live_pipe,
                 "-c:v", "libx264",
                 "-b:v", "1500k",
@@ -268,6 +267,7 @@ class Avatar:
                             break
                         with open(seg_path, "rb") as seg_file:
                             shutil.copyfileobj(seg_file, pipe)
+                        pipe.flush()
                         if not first_segment_sent:
                             first_segment_event.set()
                             first_segment_sent = True
@@ -353,8 +353,9 @@ class Avatar:
                     "-framerate", str(fps),
                     "-i", "pipe:0",
                     "-c:v", "libx264",
-                    "-g", "10",
+                    "-g", str(fps),
                     "-force_key_frames", "expr:gte(t,0)",
+                    "-sc_threshold", "0",
                     "-pix_fmt", "yuv420p",
                     "-preset", "veryfast",
                     "-crf", "23",
