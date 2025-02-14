@@ -61,6 +61,8 @@ def start_dash_packager(fifo_path, manifest_path, chunk_duration):
         "-re",
         "-i", fifo_path,
         "-c", "copy",
+        "-reset_timestamps", "1",
+        "-movflags", "faststart",
         "-f", "dash",
         "-window_size", "5",
         "-live", "1",
