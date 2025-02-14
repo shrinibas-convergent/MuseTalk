@@ -86,6 +86,7 @@ def append_segment_to_fifo(segment_path, fifo_path, timeout=5):
         "-y",
         "-i", segment_path,
         "-c", "copy",
+        "-bsf:v", "h264_mp4toannexb",
         "-f", "mpegts",
         ts_temp
     ]
@@ -269,22 +270,8 @@ class Avatar:
 
             # Start persistent dash muxer process using ffmpeg.
             manifest_path = os.path.join(base_dir, "manifest.mpd")
-            dash_cmd = [
-                "ffmpeg",
-                "-re",
-                "-i", fifo_path,
-                "-c", "copy",
-                "-f", "dash",
-                "-window_size", "5",
-                "-live", "1",
-                "-update_period", "2",
-                "-seg_duration", str(chunk_duration),
-                manifest_path
-            ]
-            print("Starting persistent dash muxer with command:")
-            print(" ".join(dash_cmd))
-            dash_proc = subprocess.Popen(dash_cmd)
-            # We'll feed segments into the FIFO as they are produced.
+            dash_proc = start_dash_packager(fifo_path, manifest_path, chunk_duration)
+            # Now, segments will be fed into the FIFO.
 
             # Split the input audio into chunks.
             split_cmd = [
