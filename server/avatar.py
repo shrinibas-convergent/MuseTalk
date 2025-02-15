@@ -224,7 +224,10 @@ class Avatar:
             dash_cmd = [
                 "ffmpeg",
                 "-i", live_pipe,
+                "-fflags", "+genpts",
                 "-reset_timestamps", "1",
+                "-vf", "setpts=PTS-STARTPTS",       
+                "-af", "asetpts=PTS-STARTPTS",
                 "-c:v", "libx264",
                 "-b:v", "1500k",
                 "-c:a", "aac",
@@ -244,6 +247,8 @@ class Avatar:
                 "ffmpeg",
                 "-y",
                 "-i", audio_path,
+                "-fflags", "+genpts",
+                "-reset_timestamps", "1",
                 "-f", "segment",
                 "-segment_time", str(chunk_duration),
                 "-c", "copy",
@@ -342,8 +347,6 @@ class Avatar:
                     print("First chunk has insufficient frames; waiting extra 2 seconds.")
                     time.sleep(2)
 
-                # For the first chunk, force every frame as keyframe.
-                gop_size = "1" if i == 0 else str(fps)
 
                 # Write video chunk.
                 first_frame = self.frame_list_cycle[0]
@@ -357,9 +360,11 @@ class Avatar:
                     "-video_size", f"{width}x{height}",
                     "-framerate", str(fps),
                     "-i", "pipe:0",
+                    "-fflags", "+genpts",
+                    "-vf", "setpts=PTS-STARTPTS",
                     "-c:v", "libx264",
                     "-tune", "zerolatency",
-                    "-g", gop_size,
+                    "-g", str(fps),
                     "-force_key_frames", "expr:gte(t,0)",
                     "-sc_threshold", "0",
                     "-reset_timestamps", "1",
@@ -393,6 +398,7 @@ class Avatar:
                     "-i", audio_chunk,
                     "-c:v", "copy",
                     "-c:a", "aac",
+                    "-avoid_negative_ts", "make_zero",
                     "-shortest",
                     "-f", "mpegts",
                     final_segment_path
