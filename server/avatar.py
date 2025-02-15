@@ -29,9 +29,6 @@ DEFAULT_CHUNK_DURATION = 3
 # Global semaphore to limit concurrent inference requests.
 inference_semaphore = threading.Semaphore(1)
 
-# Global flag for reducing IO overhead: use a RAM disk for intermediate files if available.
-USE_RAMDISK = True
-RAMDISK_BASE = "/dev/shm"  # Common RAM disk path on Linux
 
 def osmakedirs(path_list):
     for path in path_list:
@@ -209,11 +206,8 @@ class Avatar:
             print("Starting chunked live DASH streaming inference ...")
             start_time = time.time()
 
-            # Use a RAM disk for intermediate files to reduce IO overhead if enabled.
-            if USE_RAMDISK:
-                base_dir = os.path.join(RAMDISK_BASE, self.avatar_id, "dash_output", unique_id)
-            else:
-                base_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
+           
+            base_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
             osmakedirs([base_dir])
             audio_chunks_dir = os.path.join(base_dir, "audio_chunks")
             video_chunks_dir = os.path.join(base_dir, "video_chunks")
