@@ -14,19 +14,14 @@ from tqdm import tqdm
 import copy
 import xml.etree.ElementTree as ET
 
-# Import helper functions from the musetalk package
 from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
 from musetalk.utils.blending import get_image_blending
 from musetalk.utils.utils import datagen
 
-# Import global models from model.py
 from server.model import audio_processor, vae, unet, pe, device, timesteps
-
-# Import configuration defaults
 from server.config import DEFAULT_BATCH_SIZE, RESULTS_DIR
 DEFAULT_CHUNK_DURATION = 3
 
-# Global semaphore to limit concurrent inference requests.
 inference_semaphore = threading.Semaphore(1)
 
 
@@ -136,8 +131,6 @@ class Avatar:
         print("Preparing avatar data materials ...")
         with open(self.avatar_info_path, "w") as f:
             json.dump(self.avatar_info, f)
-
-        # If video_path is a file, extract frames.
         if os.path.isfile(self.video_path):
             cap = cv2.VideoCapture(self.video_path)
             count = 0
@@ -170,15 +163,11 @@ class Avatar:
             resized_crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
             latents = vae.get_latents_for_unet(resized_crop_frame)
             input_latent_list.append(latents)
-
-        # Create a cycle by mirroring the lists.
         self.frame_list_cycle = frame_list + frame_list[::-1]
         self.coord_list_cycle = coord_list + coord_list[::-1]
         self.input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
         self.mask_coords_list_cycle = []
         self.mask_list_cycle = []
-
-        # For simplicity, we use a grayscale version of the frame as the mask.
         for i, frame in enumerate(frame_list + frame_list[::-1]):
             cv2.imwrite(os.path.join(self.full_imgs_path, f"{i:08d}.png"), frame)
             mask = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -205,27 +194,22 @@ class Avatar:
         with inference_semaphore:
             print("Starting chunked live DASH streaming inference ...")
             start_time = time.time()
-
-           
             base_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
             osmakedirs([base_dir])
             audio_chunks_dir = os.path.join(base_dir, "audio_chunks")
             video_chunks_dir = os.path.join(base_dir, "video_chunks")
             segments_dir = os.path.join(base_dir, "segments")
             osmakedirs([audio_chunks_dir, video_chunks_dir, segments_dir])
-
-            # Create a named pipe for the live stream input.
             live_pipe = os.path.join(base_dir, "live_pipe.ts")
             if not os.path.exists(live_pipe):
                 os.mkfifo(live_pipe)
             manifest_path = os.path.join(base_dir, "manifest.mpd")
-
-            # Start a persistent ffmpeg process that reads from the named pipe and outputs DASH.
             dash_cmd = [
                 "ffmpeg",
                 "-i", live_pipe,
                 "-fflags", "+genpts",
                 "-reset_timestamps", "1",
+                "-start_at_zero",
                 "-vf", "setpts=PTS-STARTPTS",       
                 "-af", "asetpts=PTS-STARTPTS",
                 "-c:v", "libx264",
@@ -237,6 +221,7 @@ class Avatar:
                 "-use_template", "1",
                 "-use_timeline", "1",
                 "-seg_duration", str(chunk_duration),
+                "-muxdelay", "0",
                 manifest_path
             ]
             dash_proc = subprocess.Popen(dash_cmd)
@@ -251,7 +236,7 @@ class Avatar:
                 "-reset_timestamps", "1",
                 "-f", "segment",
                 "-segment_time", str(chunk_duration),
-                "-c", "copy",
+                "-c:a", "pcm_s16le",
                 os.path.join(audio_chunks_dir, "chunk_%03d.wav")
             ]
             subprocess.run(split_cmd, check=True)
@@ -263,14 +248,12 @@ class Avatar:
             # Create a thread-safe queue for TS segments.
             segment_queue = queue.Queue()
             first_segment_event = threading.Event()
-
-            # This thread opens the named pipe once and writes segments continuously.
             def pipe_writer():
                 with open(live_pipe, "wb") as pipe:
                     first_segment_sent = False
                     while True:
                         seg_path = segment_queue.get()
-                        if seg_path is None:  # Sentinel value to end the thread.
+                        if seg_path is None:
                             break
                         with open(seg_path, "rb") as seg_file:
                             shutil.copyfileobj(seg_file, pipe, length=64*1024)
@@ -283,14 +266,11 @@ class Avatar:
 
             pipe_writer_thread = threading.Thread(target=pipe_writer, daemon=True)
             pipe_writer_thread.start()
-
-            # Process each audio chunk and generate video segments.
             def process_chunk(i, audio_chunk):
                 print(f"Processing chunk {i+1}/{len(audio_chunks)}: {audio_chunk}")
                 # Compute features for the current chunk.
                 whisper_feature = audio_processor.audio2feat(audio_chunk)
                 whisper_chunks = audio_processor.feature2chunks(whisper_feature, fps)
-                total_frames = len(whisper_chunks)
                 res_frame_queue = queue.Queue()
                 raw_frame_queue = queue.Queue()
                 local_idx = 0
@@ -333,8 +313,6 @@ class Avatar:
                         combined_frame = get_image_blending(ori_frame, res_frame_resized, bbox, mask, mask_crop_box)
                         raw_frame_queue.put(combined_frame)
                         local_idx += 1
-
-                # Launch both threads for inference and processing.
                 inf_thread = threading.Thread(target=inference_worker)
                 proc_thread = threading.Thread(target=processing_worker)
                 inf_thread.start()
@@ -346,9 +324,6 @@ class Avatar:
                 if i == 0 and local_idx < 5:
                     print("First chunk has insufficient frames; waiting extra 2 seconds.")
                     time.sleep(2)
-
-
-                # Write video chunk.
                 first_frame = self.frame_list_cycle[0]
                 height, width, _ = first_frame.shape
                 video_chunk_path = os.path.join(video_chunks_dir, f"video_chunk_{i:03d}.mp4")
@@ -362,12 +337,13 @@ class Avatar:
                     "-i", "pipe:0",
                     "-fflags", "+genpts",
                     "-vf", "setpts=PTS-STARTPTS",
+                    "-reset_timestamps", "1",
+                    "-start_at_zero",
                     "-c:v", "libx264",
                     "-tune", "zerolatency",
                     "-g", str(fps),
                     "-force_key_frames", "expr:gte(t,0)",
                     "-sc_threshold", "0",
-                    "-reset_timestamps", "1",
                     "-pix_fmt", "yuv420p",
                     "-preset", "veryfast",
                     "-crf", "23",
@@ -387,8 +363,6 @@ class Avatar:
                 ffmpeg_process.wait()
                 wait_for_file(video_chunk_path)
                 wait_for_file(audio_chunk)
-
-                # Mux video and audio into a TS segment.
                 final_segment_path = os.path.join(segments_dir, f"segment_{i:03d}.ts")
                 mux_cmd = [
                     "ffmpeg",
@@ -397,9 +371,12 @@ class Avatar:
                     "-i", video_chunk_path,
                     "-i", audio_chunk,
                     "-reset_timestamps", "1",
+                    "-start_at_zero",
+                    "-af", "asetpts=PTS-STARTPTS",
                     "-c:v", "copy",
                     "-c:a", "aac",
                     "-avoid_negative_ts", "make_zero",
+                    "-muxdelay", "0",
                     "-shortest",
                     "-f", "mpegts",
                     final_segment_path
@@ -408,13 +385,8 @@ class Avatar:
                 print(f"Segment {i:03d} created.")
                 # Enqueue the segment for live streaming.
                 segment_queue.put(final_segment_path)
-
-            # Process the first chunk synchronously.
             process_chunk(0, audio_chunks[0])
             first_segment_event.wait()
-
-
-            # Process remaining chunks in a background thread.
             def process_remaining():
                 for i in range(1, len(audio_chunks)):
                     process_chunk(i, audio_chunks[i])
