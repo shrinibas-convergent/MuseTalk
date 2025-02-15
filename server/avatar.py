@@ -29,6 +29,10 @@ DEFAULT_CHUNK_DURATION = 3
 # Global semaphore to limit concurrent inference requests.
 inference_semaphore = threading.Semaphore(1)
 
+# Global flag for reducing IO overhead: use a RAM disk for intermediate files if available.
+USE_RAMDISK = True
+RAMDISK_BASE = "/dev/shm"  # Common RAM disk path on Linux
+
 def osmakedirs(path_list):
     for path in path_list:
         os.makedirs(path, exist_ok=True)
@@ -205,8 +209,11 @@ class Avatar:
             print("Starting chunked live DASH streaming inference ...")
             start_time = time.time()
 
-            # Create base directory for this request.
-            base_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
+            # Use a RAM disk for intermediate files to reduce IO overhead if enabled.
+            if USE_RAMDISK:
+                base_dir = os.path.join(RAMDISK_BASE, self.avatar_id, "dash_output", unique_id)
+            else:
+                base_dir = os.path.join(self.avatar_path, "dash_output", unique_id)
             osmakedirs([base_dir])
             audio_chunks_dir = os.path.join(base_dir, "audio_chunks")
             video_chunks_dir = os.path.join(base_dir, "video_chunks")
@@ -268,7 +275,7 @@ class Avatar:
                         if seg_path is None:  # Sentinel value to end the thread.
                             break
                         with open(seg_path, "rb") as seg_file:
-                            shutil.copyfileobj(seg_file, pipe)
+                            shutil.copyfileobj(seg_file, pipe, length=64*1024)
                         pipe.flush()
                         if not first_segment_sent:
                             first_segment_event.set()
@@ -342,6 +349,9 @@ class Avatar:
                     print("First chunk has insufficient frames; waiting extra 2 seconds.")
                     time.sleep(2)
 
+                # For the first chunk, force every frame as keyframe.
+                gop_size = "1" if i == 0 else str(fps)
+
                 # Write video chunk.
                 first_frame = self.frame_list_cycle[0]
                 height, width, _ = first_frame.shape
@@ -355,7 +365,8 @@ class Avatar:
                     "-framerate", str(fps),
                     "-i", "pipe:0",
                     "-c:v", "libx264",
-                    "-g", str(fps),
+                    "-tune", "zerolatency",
+                    "-g", gop_size,
                     "-force_key_frames", "expr:gte(t,0)",
                     "-sc_threshold", "0",
                     "-reset_timestamps", "1",
@@ -413,8 +424,9 @@ class Avatar:
             remaining_thread = threading.Thread(target=process_remaining, daemon=True)
             remaining_thread.start()
             
-            timeout_manifest = time.time() + 30  # wait up to 100 seconds
-            while time.time() < timeout_manifest:
+            # Wait until both audio and video SegmentTimelines contain at least one S element.
+            print("Waiting for DASH manifest to be fully ready...")
+            while True:
                 try:
                     tree = ET.parse(manifest_path)
                     root = tree.getroot()
@@ -432,8 +444,9 @@ class Avatar:
                                 elif contentType == "audio":
                                     audio_ready = True
                     if video_ready and audio_ready:
+                        print("Both audio and video segment timelines are ready.")
                         break
-                except Exception as e:
+                except Exception:
                     pass
                 time.sleep(0.1)
             print(f"Inference processing complete (first chunk). Total time so far: {time.time() - start_time:.2f}s")
