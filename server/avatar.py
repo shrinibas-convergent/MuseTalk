@@ -396,6 +396,7 @@ class Avatar:
                     "-fflags", "+genpts",
                     "-i", video_chunk_path,
                     "-i", audio_chunk,
+                    "-reset_timestamps", "1",
                     "-c:v", "copy",
                     "-c:a", "aac",
                     "-avoid_negative_ts", "make_zero",
