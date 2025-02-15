@@ -131,10 +131,10 @@
 
     <script>
       // Replace with your actual server URL.
-      const baseUrl = "https://9a9d-35-230-80-191.ngrok-free.app";
+      const baseUrl = "https://6e7d-34-32-130-20.ngrok-free.app";
 
       // Function to poll for manifest availability.
-      async function pollForManifest(manifestUrl, interval = 2000) {
+      async function pollForManifest(manifestUrl, interval = 3000) {
         let manifestReady = false;
         while (!manifestReady) {
           try {
@@ -144,7 +144,7 @@
               break;
             }
           } catch (error) {
-            // Ignore error and try again.
+            console.log(error);
           }
           await new Promise((resolve) => setTimeout(resolve, interval));
         }
