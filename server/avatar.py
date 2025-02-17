@@ -231,7 +231,7 @@ class Avatar:
                 "-fflags", "+genpts",
                 "-f", "segment",
                 "-segment_time", str(chunk_duration),
-                "-c:a", "pcm_s16le",
+                "-c:a", "aac",
                 os.path.join(audio_chunks_dir, "chunk_%03d.wav")
             ]
             subprocess.run(split_cmd, check=True)
@@ -316,9 +316,7 @@ class Avatar:
                 proc_thread.join()
                 print(f"Chunk {i} generated {local_idx} frames.")
 
-                if i == 0 and local_idx < 5:
-                    print("First chunk has insufficient frames; waiting extra 2 seconds.")
-                    time.sleep(2)
+                
                 first_frame = self.frame_list_cycle[0]
                 height, width, _ = first_frame.shape
                 video_chunk_path = os.path.join(video_chunks_dir, f"video_chunk_{i:03d}.mp4")
@@ -360,10 +358,12 @@ class Avatar:
                 mux_cmd = [
                     "ffmpeg",
                     "-y",
-                    "-fflags", "+genpts+igndts",
+                    "-fflags", "+genpts",
                     "-i", video_chunk_path,
                     "-i", audio_chunk,
-                    "-c:v", "copy",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "23",
                     "-c:a", "aac",
                     "-muxdelay", "0",
                     "-shortest",
