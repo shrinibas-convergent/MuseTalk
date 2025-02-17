@@ -360,12 +360,11 @@ class Avatar:
                 mux_cmd = [
                     "ffmpeg",
                     "-y",
-                    "-fflags", "+genpts",
+                    "-fflags", "+genpts+igndts",
                     "-i", video_chunk_path,
                     "-i", audio_chunk,
                     "-c:v", "copy",
                     "-c:a", "aac",
-                    "-avoid_negative_ts", "make_zero",
                     "-muxdelay", "0",
                     "-shortest",
                     "-f", "mpegts",
